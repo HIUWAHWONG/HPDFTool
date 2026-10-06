@@ -1,12 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 a = Analysis(
     ['HPDFTool.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['pymupdf', 'fitz', 'PIL', 'PIL._imagingtk'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
