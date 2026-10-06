@@ -1,5 +1,9 @@
 # HPDFTool Pro - Professional Offline PDF Toolkit
 
+[![Download Standalone 7Z](https://shields.io)](HPDFTool%20Pro%20v1.0.0.7z)
+[![GitHub Release](https://shields.io)](https://github.com)
+
+
 **HPDFTool Pro** is a modern, full-featured, and completely offline desktop PDF utility built with Python and Tkinter. Designed for maximum productivity, it is entirely **ad-free** and processes all data strictly on your local machine to guarantee data privacy. 
 
 Its standout core feature is its **In-place Text Editor**, powered by PyMuPDF. Unlike standard PDF tools that only overlay text, HPDFTool Pro extracts exact character coordinates, font sizes, scales, colors, and background attributes, allowing you to click directly on the PDF layout and modify text while preserving images and vector graphics natively.
