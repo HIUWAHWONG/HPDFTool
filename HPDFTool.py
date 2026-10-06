@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# Copyright (c) 2026 HIUWAHWONG. All rights reserved.
+# Licensed under the MIT License.
 """
 HPDFTool Pro - PDF Toolkit
 -----------------------------------------------------------
@@ -9,7 +11,7 @@ In-place editing:
   1. Extract text coordinates, sizes, colors, and font styles with PyMuPDF.
   2. Click page text to edit it at its original position.
   3. Remove only edited text when saving; preserve images and vector graphics.
-     Draw replacement text with matching styling and automatic CJK font fallback.
+     Draw replacement text with matching styling and automatic CJK font fallback.     
 """
 import os
 import re

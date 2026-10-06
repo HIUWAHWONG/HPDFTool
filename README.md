@@ -92,3 +92,10 @@ The repository includes a highly optimized build automation script `build_exe.ba
 * **Isolated Sandbox Environment**: The batch script spins up an isolated Python Virtual Environment (`.venv_build`). This ensures that only target dependencies are downloaded and compiled, preventing heavy, unrelated global Python packages from bloating your deployment package.
 * **Clean Build Pipeline**: Automatically upgrades `pip`, fetches secure copies of `pymupdf`, `pillow`, and `pyinstaller` silently, and runs the compilation.
 * **Distribution Output**: Uses the `--noconsole` hidden-terminal framework to deliver a single standalone runtime execution bundle under `dist\HPDFTool.exe`. It automatically fires up a native File Explorer window focusing on the distribution file upon success.
+---
+
+## 📄 License & Copyright
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+Copyright (c) 2026 HIUWAHWONG. All rights reserved.
