@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-HPDFTool Pro - PDF Toolkit
+HPDFTool Pro  —  PDF 工具箱
 -----------------------------------------------------------
-Dependencies: pip install pymupdf pillow
-Features: in-place text editing / merge / split / watermark preview / pages to images / encryption
+依赖:  pip install pymupdf pillow
+功能:  原位编辑文字 / 合并 / 拆分 / 水印 / 转图片 / 加密解密
 
-In-place editing:
-  1. Extract text coordinates, sizes, colors, and font styles with PyMuPDF.
-  2. Click page text to edit it at its original position.
-  3. Remove only edited text when saving; preserve images and vector graphics.
-     Draw replacement text with matching styling and automatic CJK font fallback.
+原位编辑原理:
+  1. 用 PyMuPDF 提取每一行(或每个片段)文字的精确坐标、字号、颜色、字体风格
+  2. 点击页面上的文字 -> 在原位置弹出输入框修改
+  3. 保存时只擦除被修改的那一小块文字(背景/图片/矢量图形保留),
+     再用相同的位置、字号、颜色写入新文字; 中文自动使用系统中文字体
 """
 import os
 import re
@@ -25,15 +25,15 @@ import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk, simpledialog
 
 try:
-    import pymupdf as fitz  # Current PyMuPDF package name
-except ImportError:  # Legacy package name
+    import pymupdf as fitz  # PyMuPDF 新版名称
+except ImportError:  # 旧版
     import fitz
 from PIL import Image, ImageTk, ImageDraw
 
 APP_NAME = "HPDFTool Pro"
 
 # ============================================================
-#  Theme colors
+#  主题配色
 # ============================================================
 C = dict(
     bg="#F3F5F9", side="#111827", side_hover="#1F2937", side_active="#2563EB",
@@ -48,33 +48,17 @@ def pick_ui_font():
         fams = set(tkfont.families())
     except Exception:
         return "TkDefaultFont"
-    preferred = {"Windows": ("Segoe UI", "Arial"),
-                 "Darwin": ("SF Pro Text", "Helvetica Neue", "Arial")}.get(platform.system(), ())
-    for f in preferred + ("Noto Sans", "DejaVu Sans", "Liberation Sans", "Helvetica",
-                           "Segoe UI", "Microsoft YaHei UI", "Noto Sans CJK SC"):
+    for f in ("Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC",
+              "WenQuanYi Micro Hei", "Segoe UI", "Helvetica Neue", "Helvetica"):
         if f in fams:
             return f
-    return tkfont.nametofont("TkDefaultFont").actual("family")
+    return "TkDefaultFont"
 
 
-FONT = "TkDefaultFont"  # Set during App initialization
-UI_SCALE = 1.0
-
-
-def ui_px(value):
-    """Scale layout dimensions with system DPI; font sizes use Tk points."""
-    return max(1, round(value * UI_SCALE))
-
-
-def ui_fonts():
-    return dict(body=(FONT, 10), caption=(FONT, 9), section=(FONT, 11, "bold"),
-                title=(FONT, 18, "bold"), nav=(FONT, 10), brand=(FONT, 13, "bold"))
-
-
-UI = ui_fonts()
+FONT = "TkDefaultFont"  # 在 App 初始化时赋值
 
 # ============================================================
-#  PDF text engine (independent of the UI)
+#  PDF 文字引擎 (与界面无关)
 # ============================================================
 CJK_RE = re.compile(r"[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef\u3000-\u303f\uac00-\ud7af]")
 OPEN_P = set("（［｛《〈「『【〔“‘")
@@ -93,13 +77,13 @@ CJK_FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
 ]
 
-BASE14 = {  # (regular, bold, italic, bold italic)
+BASE14 = {  # (常规, 粗体, 斜体, 粗斜体)
     "sans": ("helv", "hebo", "heit", "hebi"),
     "serif": ("tiro", "tibo", "tiit", "tibi"),
     "mono": ("cour", "cobo", "coit", "cobi"),
 }
 
-# Common font names -> lowercase system font stems: regular, bold, italic, bold italic
+# 常见字体名 -> 系统字体文件名(不含扩展名, 小写): (常规, 粗体, 斜体, 粗斜体)
 _LIB = lambda n: tuple(f"liberation{n}-{v}" for v in ("regular", "bold", "italic", "bolditalic"))
 _MAC = lambda n: (n, n + " bold", n + " italic", n + " bold italic")
 FONT_ALIASES = {
@@ -169,7 +153,7 @@ _EMB_CACHE = {}
 
 
 def system_font_index():
-    """Index system fonts by lowercase filename stem."""
+    """扫描系统字体目录 -> {文件名(小写,无扩展名): 路径}"""
     global _SYS_INDEX
     if _SYS_INDEX is not None:
         return _SYS_INDEX
@@ -196,7 +180,7 @@ def system_font_index():
 
 
 def system_font_for(style):
-    """Find a system font matching the original font name."""
+    """按字体名在系统里找「同名字体」"""
     fam = norm_raw(style["font"])
     for suf in ("bolditalic", "boldoblique", "semibold", "bold", "italic", "oblique", "regular"):
         fam = fam.replace(suf, "")
@@ -221,7 +205,7 @@ def system_font_for(style):
                     if found:
                         break
             break
-    if found is None:  # Fuzzy match the family name after removing style suffixes; preserve weight and slant.
+    if found is None:  # 通用模糊匹配: 去掉 Bold/Italic/Regular/Book 等后名称相同, 且粗/斜体一致
         base = _core_name(fam)
         for core, sb, si, path in _fuzzy_index():
             if core == base and sb == bold and si == italic:
@@ -257,41 +241,12 @@ def _fuzzy_index():
 
 
 class FontKit:
-    """Font cache and mixed Latin/CJK drawing for watermarks and other simple text."""
+    """基础字体缓存 + 中英文混排绘制 (水印等简单场景使用)"""
 
     def __init__(self):
         self._cache = {}
         self._cjk = None
         self._cjk_tried = False
-        self._stamp_doc = None
-        self._stamp_key = None
-
-    def close(self):
-        if self._stamp_doc is not None:
-            self._stamp_doc.close()
-            self._stamp_doc = None
-            self._stamp_key = None
-
-    def watermark_stamp(self, text, size, opacity, color):
-        """Build upright text; rotate the PDF Form rather than applying TextWriter morph."""
-        key = (text, size, opacity, tuple(color))
-        if key != self._stamp_key:
-            self.close()
-            runs = self.runs(text, "hebo", has_cjk(text))
-            width = sum(f.text_length(t, size) for f, t in runs)
-            ascent = max(f.ascender for f, _ in runs) * size
-            descent = min(f.descender for f, _ in runs) * size
-            pad = max(2, size * 0.08)
-            doc = fitz.open()
-            try:
-                pg = doc.new_page(width=width + pad * 2, height=ascent - descent + pad * 2)
-                self.draw(pg, (pad, pad + ascent), text, size, color,
-                          base="hebo", cjk_primary=has_cjk(text), opacity=opacity)
-            except Exception:
-                doc.close()
-                raise
-            self._stamp_doc, self._stamp_key = doc, key
-        return self._stamp_doc
 
     def get(self, name):
         if name not in self._cache:
@@ -351,7 +306,7 @@ class FontKit:
 
 
 class FontResolver:
-    """Resolve each style: embedded font -> matching system font -> user fallback -> standard/CJK font."""
+    """为每种原样式生成字体候选链: 原嵌入字体 -> 系统同名字体 -> 自选备用 -> 标准/中文字体"""
 
     def __init__(self, doc, cache_key, user_font=None):
         self.doc = doc
@@ -366,7 +321,7 @@ class FontResolver:
         self._pf = {}
 
     def embedded(self, page, name):
-        """Return every embedded subset of the requested font on this page."""
+        """返回该字体在本页的所有嵌入副本(同一字体可能被拆成多个子集)"""
         if page.number not in self._pf:
             self._pf[page.number] = page.get_fonts(full=True)
         target = norm_raw(name)
@@ -392,7 +347,7 @@ class FontResolver:
         chain = []
         embs = self.embedded(page, style["font"])
         probe = {c for c in orig_chars if not c.isspace()}
-        # Use an embedded font only when its character map covers all original characters.
+        # 验证: 原文里的每个字都能在嵌入字体里找到, 说明字符映射可靠; 才启用嵌入字体
         covers = [(sum(1 for c in probe if f.has_glyph(ord(c))), f) for f in embs]
         if probe and all(any(f.has_glyph(ord(c)) for f in embs) for c in probe):
             for n, f in sorted(covers, key=lambda x: -x[0]):
@@ -414,9 +369,9 @@ class FontResolver:
         return chain
 
 
-# ---------- Text unit extraction ----------
+# ---------- 文字单元提取 ----------
 def _norm_char(ch):
-    """Normalize CJK compatibility ideographs (U+F900-FAFF) for find and replace."""
+    """CJK 兼容汉字(U+F900-FAFF)规范化为普通汉字, 方便查找替换"""
     if "\uf900" <= ch <= "\ufaff":
         n = unicodedata.normalize("NFC", ch)
         if len(n) == 1:
@@ -460,7 +415,7 @@ def _build_unit(idx, mode, lines):
 
 
 def extract_units(page, mode="line"):
-    """Modes: line (split at large horizontal gaps), span, or paragraph."""
+    """mode: line=整行(按横向间隔分段) / span=文本片段 / para=段落"""
     units = []
     if page.rotation != 0:
         return units
@@ -486,7 +441,7 @@ def extract_units(page, mode="line"):
                 continue
             if mode == "span":
                 groups = [[s] for s in spans if s["text"].strip()]
-            else:  # Split at large tab/column gaps to keep distant text segments separate.
+            else:  # 按大间隔(制表/分栏)切开, 避免把相距很远的两段文字挤到一起
                 groups, cur = [], [spans[0]]
                 for prev, s in zip(spans, spans[1:]):
                     gap = s["bbox"][0] - prev["bbox"][2]
@@ -503,9 +458,9 @@ def extract_units(page, mode="line"):
     return units
 
 
-# ---------- Replacement text layout ----------
+# ---------- 修改后的排版 ----------
 def diff_tokens(old_tokens, new_text):
-    """Map original styles by character diff; inserted text inherits neighboring styles."""
+    """按字符差异把原样式映射到新文字: 没改的字保持原样式, 新增的字继承相邻字样式"""
     old = "".join(c for c, _ in old_tokens)
     if not old_tokens:
         return [(c, 0) for c in new_text]
@@ -582,7 +537,7 @@ def plan_edit(page, e, resolver, fit, warnings):
             if sel is None:
                 sel = chains[sid][0]
                 if not ch.isspace():
-                    warnings.add("Some characters have no available glyph and may appear as boxes.")
+                    warnings.add("个别字符在所有可用字体中都找不到，可能显示为方块")
             cache[k] = sel
         return cache[k]
 
@@ -614,9 +569,9 @@ def plan_edit(page, e, resolver, fit, warnings):
                 lines = run(scale)
         y_last = u["y_first"] + (len(lines) - 1) * u["pitch"] * scale
         if y_last > pr.y1 - 10:
-            warnings.add("An expanded paragraph extends beyond the bottom of the page.")
+            warnings.add("段落变长后超出了页面底部")
         elif not fit and len(lines) > u["n_lines"]:
-            warnings.add("Expanded text may overlap content below. Enable Auto-shrink long text if needed.")
+            warnings.add("有段落变长，可能压到下方内容（可勾选「缩小字号」）")
     else:
         def line_w(sc):
             return sum(pick(t[1], t[0])[0].text_length(t[0], u["styles"][t[1]]["size"] * sc)
@@ -638,11 +593,11 @@ def plan_edit(page, e, resolver, fit, warnings):
                 used.add(src)
         out_lines.append(row)
     if not used or "alt" not in used:
-        label = "✓ Original"
+        label = "✓ 原字体"
     elif used == {"alt"}:
-        label = "≈ Fallback"
+        label = "≈ 替代字体"
     else:
-        label = "≈ Mixed"
+        label = "≈ 部分替代"
     return dict(lines=out_lines, scale=scale, label=label)
 
 
@@ -669,7 +624,7 @@ def draw_plan(page, u, plan):
 
 
 def sample_bg(img, rect, zoom):
-    """Sample the dominant color around a text box for background coverage."""
+    """取文字框外侧一圈像素的主色，用作覆盖色"""
     W, H = img.size
     x0, y0, x1, y1 = [int(v * zoom) for v in rect]
     pts = []
@@ -689,7 +644,7 @@ def sample_bg(img, rect, zoom):
 
 
 def apply_edits(src_bytes, edits, cover=False, fit=False, user_font=None):
-    """Apply edits to the original PDF and return (doc, warnings, labels)."""
+    """在原 PDF 上应用所有修改, 返回 (doc, warnings, labels)"""
     doc = fitz.open("pdf", src_bytes)
     resolver = FontResolver(doc, hash(src_bytes), user_font)
     warnings, labels = set(), [""] * len(edits)
@@ -699,7 +654,7 @@ def apply_edits(src_bytes, edits, cover=False, fit=False, user_font=None):
     for pno, items in by_page.items():
         page = doc[pno]
         plans = []
-        for i, e in items:  # Lay out text while fonts are available, then erase and redraw.
+        for i, e in items:  # 先排版(此时字体资源还在), 再擦除, 最后写入
             plan = plan_edit(page, e, resolver, fit, warnings)
             labels[i] = plan["label"]
             plans.append((e["unit"], plan))
@@ -726,7 +681,7 @@ def apply_edits(src_bytes, edits, cover=False, fit=False, user_font=None):
 
 
 def words_to_text(words, merge=True):
-    """Reconstruct selected words; merge=True combines paragraph lines."""
+    """把选中的单词还原成文本: 同一行的词连起来, merge=True 时整段连成一行"""
     def join(parts, dehyphen=False):
         out = ""
         for p in parts:
@@ -767,25 +722,21 @@ def parse_ranges(s, n):
         elif part.isdigit():
             a = b = int(part)
         else:
-            raise ValueError(f"Invalid page range: {part}")
+            raise ValueError(f"无法识别的页码: {part}")
         if a < 1 or b > n or a > b:
-            raise ValueError(f"Page range out of bounds: {part} (document has {n} pages)")
+            raise ValueError(f"页码超出范围: {part} (文档共 {n} 页)")
         pages.extend(range(a - 1, b))
     if not pages:
-        raise ValueError("Enter a page range, such as 1-3,5,8-.")
+        raise ValueError("请输入页码范围，例如 1-3,5,8-")
     return pages
 
 
 def add_watermark(page, kit, text, size, opacity, angle, color, tile):
-    if not text:
-        return
-    if size <= 0:
-        raise ValueError("Watermark font size must be greater than 0.")
-    stamp = kit.watermark_stamp(text, size, opacity, color)
-    w = stamp[0].rect.width
+    base = "hebo"
+    prim = has_cjk(text)
+    f_runs = kit.runs(text, base, prim)
+    w = sum(f.text_length(t, size) for f, t in f_runs)
     rect = page.rect
-    rotation = page.rotation
-    derotation = page.derotation_matrix
     centers = []
     if tile:
         stepx, stepy = w + size * 2.5, size * 5
@@ -800,111 +751,37 @@ def add_watermark(page, kit, text, size, opacity, angle, color, tile):
             row += 1
     else:
         centers.append((rect.width / 2, rect.height / 2))
-    # Rotate the PDF Form without reflection and compensate for the page display rotation.
-    turn = (angle + rotation) % 360
-    bounds = stamp[0].rect * fitz.Matrix(turn)
-    try:
-        page.set_rotation(0)
-        for cx, cy in centers:
-            center = fitz.Point(cx, cy) * derotation
-            target = fitz.Rect(center.x - bounds.width / 2, center.y - bounds.height / 2,
-                               center.x + bounds.width / 2, center.y + bounds.height / 2)
-            page.show_pdf_page(target, stamp, rotate=turn, keep_proportion=True, overlay=True)
-    finally:
-        page.set_rotation(rotation)
+    for cx, cy in centers:
+        origin = fitz.Point(cx - w / 2, cy + size * 0.3)
+        morph = (fitz.Point(cx, cy), fitz.Matrix(angle))
+        kit.draw(page, origin, text, size, color, base=base, cjk_primary=prim,
+                 opacity=opacity, morph=morph)
 
 
 # ============================================================
-#  UI helpers
+#  界面辅助
 # ============================================================
 def make_card(parent, title=None):
     outer = tk.Frame(parent, bg=C["card"], highlightbackground=C["border"], highlightthickness=1)
     if title:
         tk.Label(outer, text=title, bg=C["card"], fg=C["text"],
-                 font=UI["section"]).pack(anchor="w", padx=ui_px(16), pady=(ui_px(12), ui_px(4)))
+                 font=(FONT, 11, "bold")).pack(anchor="w", padx=16, pady=(12, 2))
     return outer
-
-
-def wrapped_label(parent, **kwargs):
-    opts = dict(bg=C["card"], fg=C["sub"], font=UI["caption"],
-                anchor="w", justify="left", wraplength=ui_px(260))
-    opts.update(kwargs)
-    label = tk.Label(parent, **opts)
-    label.bind("<Configure>", lambda e: label.config(wraplength=max(ui_px(80), e.width)), add="+")
-    return label
-
-
-def scrollable_area(parent):
-    """Fill available space; allow scrolling when the panel is too small."""
-    outer = tk.Frame(parent, bg=C["card"])
-    outer.pack(fill="both", expand=True)
-    canvas = tk.Canvas(outer, bg=C["card"], highlightthickness=0, width=1, height=1)
-    bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-    bar.pack(side="right", fill="y")
-    canvas.pack(side="left", fill="both", expand=True)
-    canvas.configure(yscrollcommand=bar.set)
-    content = tk.Frame(canvas, bg=C["card"])
-    item = canvas.create_window(0, 0, window=content, anchor="nw")
-    visible = [True]
-
-    def resize(event=None):
-        width, height = canvas.winfo_width(), canvas.winfo_height()
-        requested = content.winfo_reqheight()
-        canvas.itemconfigure(item, width=max(width, 1), height=max(height, requested))
-        canvas.configure(scrollregion=(0, 0, width, max(height, requested)))
-        need_scroll = requested > height + 1
-        if need_scroll != visible[0]:
-            if need_scroll:
-                bar.pack(side="right", fill="y", before=canvas)
-            else:
-                bar.pack_forget()
-            visible[0] = need_scroll
-
-    canvas.bind("<Configure>", resize)
-    content.bind("<Configure>", resize)
-
-    def wheel(event, direction=None):
-        widget = event.widget
-        if widget.winfo_class() in ("Text", "Treeview", "Listbox", "TCombobox", "TSpinbox"):
-            return None  # These widgets handle their own scrolling and selection.
-        while widget is not None:
-            if widget is content or widget is canvas:
-                if visible[0]:
-                    step = direction if direction is not None else (-1 if event.delta > 0 else 1)
-                    canvas.yview_scroll(step * 3, "units")
-                    return "break"
-                return None
-            widget = getattr(widget, "master", None)
-        return None
-
-    top = parent.winfo_toplevel()
-    top.bind("<MouseWheel>", wheel, add="+")
-    top.bind("<Button-4>", lambda e: wheel(e, -1), add="+")
-    top.bind("<Button-5>", lambda e: wheel(e, 1), add="+")
-    return content
 
 
 class App:
     PAD = 24
 
     def __init__(self, root):
-        global FONT, UI, UI_SCALE
+        global FONT
         self.root = root
         FONT = pick_ui_font()
-        UI = ui_fonts()
-        UI_SCALE = max(0.85, min(root.winfo_fpixels("1i") / 96.0, 3.0))
-        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont", "TkTooltipFont"):
-            tkfont.nametofont(name).configure(family=FONT, size=10)
-        root.option_add("*Font", UI["body"])
-        root.title(f"{APP_NAME} - PDF Toolkit")
-        available_w = max(800, root.winfo_screenwidth() - ui_px(64))
-        available_h = max(540, root.winfo_screenheight() - ui_px(90))
-        width, height = min(ui_px(1320), available_w), min(ui_px(840), available_h)
-        root.geometry(f"{width}x{height}")
-        root.minsize(min(ui_px(1000), available_w), min(ui_px(640), available_h))
+        root.title(f"{APP_NAME} — PDF 工具箱")
+        root.geometry("1320x840")
+        root.minsize(1100, 700)
         root.configure(bg=C["bg"])
 
-        # ---- Editor state ----
+        # ---- 编辑器状态 ----
         self.src_bytes = None
         self.src_path = None
         self.orig_doc = None
@@ -922,7 +799,7 @@ class App:
         self.hover_unit = None
 
         self.user_font = None
-        # ---- Selection and copy ----
+        # ---- 选择复制 ----
         self.tool = tk.StringVar(value="edit")
         self.merge_var = tk.BooleanVar(value=True)
         self.autocopy_var = tk.BooleanVar(value=True)
@@ -935,7 +812,7 @@ class App:
         self.mode_var = tk.StringVar(value="line")
         self.cover_var = tk.BooleanVar(value=False)
         self.fit_var = tk.BooleanVar(value=False)
-        self.status = tk.StringVar(value="Ready")
+        self.status = tk.StringVar(value="就绪")
 
         self.setup_style()
         self.build_shell()
@@ -952,18 +829,18 @@ class App:
         root.bind("<Control-z>", lambda e: self.undo_last())
 
     # ------------------------------------------------------------
-    #  Styles
+    #  样式
     # ------------------------------------------------------------
     def setup_style(self):
         s = ttk.Style()
         s.theme_use("clam")
-        s.configure(".", font=UI["body"], background=C["bg"], foreground=C["text"])
+        s.configure(".", font=(FONT, 10), background=C["bg"], foreground=C["text"])
         s.configure("TFrame", background=C["bg"])
         s.configure("Card.TFrame", background=C["card"])
         s.configure("TLabel", background=C["bg"], foreground=C["text"])
         s.configure("Card.TLabel", background=C["card"])
-        s.configure("Sub.TLabel", background=C["card"], foreground=C["sub"], font=UI["caption"])
-        s.configure("TButton", padding=(ui_px(12), ui_px(7)), background=C["card"], foreground=C["text"],
+        s.configure("Sub.TLabel", background=C["card"], foreground=C["sub"], font=(FONT, 9))
+        s.configure("TButton", padding=(14, 7), background=C["card"], foreground=C["text"],
                     bordercolor="#D1D5DB", lightcolor=C["card"], darkcolor=C["card"], relief="solid", borderwidth=1)
         s.map("TButton", background=[("active", "#EEF2FF"), ("disabled", "#F3F4F6")],
               foreground=[("disabled", "#9CA3AF")])
@@ -972,67 +849,65 @@ class App:
                     font=(FONT, 10, "bold"))
         s.map("Accent.TButton", background=[("active", C["accent_h"]), ("disabled", "#93C5FD")],
               foreground=[("disabled", "#FFFFFF")])
-        s.configure("Tool.TButton", padding=(ui_px(8), ui_px(5)))
+        s.configure("Tool.TButton", padding=(9, 5))
         s.configure("TEntry", fieldbackground="#FFFFFF", bordercolor=C["border"],
-                    lightcolor="#FFFFFF", darkcolor="#FFFFFF", padding=ui_px(6))
-        s.configure("TCombobox", fieldbackground="#FFFFFF", bordercolor=C["border"], padding=ui_px(5))
-        s.configure("TSpinbox", fieldbackground="#FFFFFF", bordercolor=C["border"], padding=ui_px(5))
+                    lightcolor="#FFFFFF", darkcolor="#FFFFFF", padding=6)
+        s.configure("TCombobox", fieldbackground="#FFFFFF", bordercolor=C["border"], padding=5)
+        s.configure("TSpinbox", fieldbackground="#FFFFFF", bordercolor=C["border"], padding=5)
         for w in ("TCheckbutton", "TRadiobutton"):
             s.configure(w, background=C["card"])
             s.map(w, background=[("active", C["card"]), ("disabled", C["card"])],
                   foreground=[("disabled", "#9CA3AF")])
-        s.configure("Treeview", rowheight=ui_px(30), background="#FFFFFF", fieldbackground="#FFFFFF",
-                    bordercolor=C["border"], borderwidth=0, font=UI["body"])
-        s.configure("Treeview.Heading", background="#F9FAFB", foreground=C["text"],
-                    font=UI["body"], relief="flat", padding=ui_px(6))
+        s.configure("Treeview", rowheight=30, background="#FFFFFF", fieldbackground="#FFFFFF",
+                    bordercolor=C["border"], borderwidth=0, font=(FONT, 10))
+        s.configure("Treeview.Heading", background="#F9FAFB", foreground=C["sub"],
+                    font=(FONT, 9, "bold"), relief="flat", padding=6)
         s.map("Treeview", background=[("selected", "#DBEAFE")], foreground=[("selected", C["text"])])
         for o in ("Vertical", "Horizontal"):
             s.configure(f"{o}.TScrollbar", background="#C4CAD4", troughcolor=C["bg"],
                         bordercolor=C["bg"], lightcolor="#C4CAD4", darkcolor="#C4CAD4",
-                        arrowsize=ui_px(12), relief="flat")
+                        arrowsize=12, relief="flat")
         s.configure("Horizontal.TProgressbar", background=C["accent"], troughcolor="#E5E7EB",
                     bordercolor="#E5E7EB", lightcolor=C["accent"], darkcolor=C["accent"])
         s.configure("TScale", background=C["card"])
         s.configure("TSeparator", background=C["border"])
 
     # ------------------------------------------------------------
-    #  Shell: sidebar, content area, and status bar
+    #  外壳: 侧边栏 + 内容区 + 状态栏
     # ------------------------------------------------------------
     def build_shell(self):
-        bar = tk.Frame(self.root, bg="#FFFFFF", height=ui_px(30), highlightbackground=C["border"], highlightthickness=1)
+        bar = tk.Frame(self.root, bg="#FFFFFF", height=28, highlightbackground=C["border"], highlightthickness=1)
         bar.pack(side="bottom", fill="x")
-        side = tk.Frame(self.root, bg=C["side"], width=ui_px(192))
+        side = tk.Frame(self.root, bg=C["side"], width=210)
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
-        tk.Label(side, text=APP_NAME, bg=C["side"], fg="#FFFFFF",
-                 font=UI["brand"]).pack(anchor="w", padx=ui_px(18), pady=(ui_px(24), 2))
-        tk.Label(side, text="Everyday PDF tools", bg=C["side"], fg=C["side_text"],
-                 font=UI["caption"]).pack(anchor="w", padx=ui_px(18), pady=(0, ui_px(22)))
+        tk.Label(side, text="📄  " + APP_NAME, bg=C["side"], fg="#FFFFFF",
+                 font=(FONT, 14, "bold")).pack(anchor="w", padx=20, pady=(24, 2))
+        tk.Label(side, text="让 PDF 处理更简单", bg=C["side"], fg=C["side_text"],
+                 font=(FONT, 9)).pack(anchor="w", padx=22, pady=(0, 22))
 
         self.nav = {}
-        items = [("edit", "Text editor"), ("merge", "Merge PDFs"), ("split", "Split PDF"),
-                 ("wm", "Watermark"), ("img", "Pages to images"), ("sec", "Security")]
+        items = [("edit", "✎   文字编辑"), ("merge", "⊕   合并 PDF"), ("split", "✂   拆分 / 提取"),
+                 ("wm", "◈   添加水印"), ("img", "▣   导出图片"), ("sec", "🔒  加密 / 解密")]
         for key, label in items:
             lb = tk.Label(side, text=label, bg=C["side"], fg=C["side_text"], anchor="w",
-                          font=UI["nav"], padx=ui_px(16), pady=ui_px(11), cursor="hand2")
-            lb.pack(fill="x", padx=ui_px(10), pady=2)
+                          font=(FONT, 11), padx=22, pady=11, cursor="hand2")
+            lb.pack(fill="x", padx=10, pady=1)
             lb.bind("<Button-1>", lambda e, k=key: self.show_page(k))
             lb.bind("<Enter>", lambda e, w=lb, k=key: w.config(bg=C["side_hover"]) if self.cur != k else None)
             lb.bind("<Leave>", lambda e, w=lb, k=key: w.config(bg=C["side"]) if self.cur != k else None)
             self.nav[key] = lb
-        tk.Label(side, text="Ctrl+O  Open PDF\nCtrl+S  Save edits\nCtrl+Z  Undo edit", bg=C["side"], fg=C["side_text"],
-                 font=UI["caption"], justify="left").pack(side="bottom", anchor="w", padx=ui_px(18), pady=ui_px(18))
+        tk.Label(side, text="Ctrl+O 打开   Ctrl+S 保存\nCtrl+Z 撤销", bg=C["side"], fg="#6B7280",
+                 font=(FONT, 8), justify="left").pack(side="bottom", anchor="w", padx=22, pady=18)
 
         right = tk.Frame(self.root, bg=C["bg"])
         right.pack(side="left", fill="both", expand=True)
-        tk.Label(bar, textvariable=self.status, bg="#FFFFFF", fg=C["sub"], font=UI["caption"],
-                 anchor="w", width=1).pack(fill="x", padx=ui_px(14), pady=ui_px(5))
-        self.header = tk.Label(right, text="", bg=C["bg"], fg=C["text"], font=UI["title"], anchor="w")
-        self.header.pack(fill="x", padx=ui_px(20), pady=(ui_px(18), ui_px(3)))
-        self.page_hint = wrapped_label(right, text="", bg=C["bg"])
-        self.page_hint.pack(fill="x", padx=ui_px(20), pady=(0, ui_px(12)))
+        tk.Label(bar, textvariable=self.status, bg="#FFFFFF", fg=C["sub"], font=(FONT, 9),
+                 anchor="w").pack(side="left", padx=14)
+        self.header = tk.Label(right, text="", bg=C["bg"], fg=C["text"], font=(FONT, 17, "bold"), anchor="w")
+        self.header.pack(fill="x", padx=26, pady=(20, 4))
         self.container = tk.Frame(right, bg=C["bg"])
-        self.container.pack(fill="both", expand=True, padx=ui_px(20), pady=(0, ui_px(16)))
+        self.container.pack(fill="both", expand=True, padx=26, pady=(4, 16))
         self.pages = {}
         self.cur = None
 
@@ -1042,14 +917,8 @@ class App:
         self.pages[key] = f
         return f
 
-    TITLES = {"edit": "Text editor", "merge": "Merge PDFs", "split": "Split / extract pages",
-              "wm": "Watermark", "img": "Export pages as images", "sec": "Security"}
-    HINTS = {"edit": "Edit text in place, or select and copy full paragraphs.",
-             "merge": "Arrange PDF files in order and merge them into one document.",
-             "split": "Extract a page range or save each page as a separate PDF.",
-             "wm": "Adjust the watermark on the left; preview it on the right. Save applies it to every page.",
-             "img": "Export each complete page as a separate PNG or JPG image.",
-             "sec": "Protect a PDF with a password or remove existing password protection."}
+    TITLES = {"edit": "文字编辑", "merge": "合并 PDF", "split": "拆分 / 提取页面",
+              "wm": "添加水印", "img": "导出为图片", "sec": "加密 / 解密"}
 
     def show_page(self, key):
         self.cur = key
@@ -1058,9 +927,6 @@ class App:
                       fg="#FFFFFF" if k == key else C["side_text"])
         self.pages[key].tkraise()
         self.header.config(text=self.TITLES[key])
-        self.page_hint.config(text=self.HINTS[key])
-        if key == "wm":
-            self.wm_schedule_preview()
 
     def set_status(self, msg):
         self.status.set(msg)
@@ -1070,15 +936,15 @@ class App:
         self.root.config(cursor="watch" if on else "")
         self.root.update_idletasks()
 
-    def file_row(self, parent, var, cmd, text="Choose file"):
+    def file_row(self, parent, var, cmd, text="选择文件"):
         row = tk.Frame(parent, bg=C["card"])
-        row.pack(fill="x", padx=ui_px(16), pady=(ui_px(6), ui_px(14)))
+        row.pack(fill="x", padx=16, pady=(6, 14))
         e = ttk.Entry(row, textvariable=var, state="readonly")
         e.pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text=text, command=cmd).pack(side="left", padx=(ui_px(10), 0))
+        ttk.Button(row, text=text, command=cmd).pack(side="left", padx=(10, 0))
 
     def pick_pdf(self, var, after=None):
-        p = filedialog.askopenfilename(title="Choose PDF", filetypes=[("PDF files", "*.pdf")])
+        p = filedialog.askopenfilename(title="选择 PDF", filetypes=[("PDF 文件", "*.pdf")])
         if p:
             var.set(p)
             if after:
@@ -1088,11 +954,11 @@ class App:
     def ask_password(doc, path):
         if not doc.needs_pass:
             return True
-        pw = simpledialog.askstring("Password required", f"Enter the password for {os.path.basename(path)}:", show="*")
+        pw = simpledialog.askstring("需要密码", f"{os.path.basename(path)} 已加密，请输入密码：", show="*")
         return bool(pw) and bool(doc.authenticate(pw))
 
     # ============================================================
-    #  1. Text editor
+    #  1. 文字编辑
     # ============================================================
     def build_editor(self):
         page = self.page_frame("edit")
@@ -1100,38 +966,34 @@ class App:
         tb = make_card(page)
         tb.pack(fill="x")
         inner = tk.Frame(tb, bg=C["card"])
-        inner.pack(fill="x", padx=ui_px(12), pady=(ui_px(10), ui_px(6)))
-        ttk.Button(inner, text="Open PDF", style="Accent.TButton", command=self.open_pdf).pack(side="left")
-        self.btn_save = ttk.Button(inner, text="Save as...", command=self.save_pdf, state="disabled")
-        self.btn_save.pack(side="left", padx=(ui_px(8), 0))
-        ttk.Button(inner, text="Find and replace", style="Tool.TButton", command=self.find_replace).pack(side="right")
-        inner = tk.Frame(tb, bg=C["card"])
-        inner.pack(fill="x", padx=ui_px(12), pady=(0, ui_px(10)))
+        inner.pack(fill="x", padx=12, pady=10)
+        ttk.Button(inner, text="📂 打开", style="Accent.TButton", command=self.open_pdf).pack(side="left")
+        self.btn_save = ttk.Button(inner, text="💾 保存为…", command=self.save_pdf, state="disabled")
+        self.btn_save.pack(side="left", padx=(8, 18))
 
         self.btn_prev = ttk.Button(inner, text="◀", width=3, style="Tool.TButton", command=lambda: self.goto(self.page_no - 1), state="disabled")
         self.btn_prev.pack(side="left")
         self.page_entry = ttk.Entry(inner, width=4, justify="center")
         self.page_entry.pack(side="left", padx=4)
         self.page_entry.bind("<Return>", lambda e: self.goto(self._page_from_entry()))
-        self.page_total = tk.Label(inner, text="/ -", bg=C["card"], fg=C["sub"], font=UI["body"])
+        self.page_total = tk.Label(inner, text="/ -", bg=C["card"], fg=C["sub"], font=(FONT, 10))
         self.page_total.pack(side="left")
         self.btn_next = ttk.Button(inner, text="▶", width=3, style="Tool.TButton", command=lambda: self.goto(self.page_no + 1), state="disabled")
-        self.btn_next.pack(side="left", padx=(4, ui_px(16)))
-        ttk.Separator(inner, orient="vertical").pack(side="left", fill="y", padx=(0, ui_px(16)))
+        self.btn_next.pack(side="left", padx=(4, 18))
 
         ttk.Button(inner, text="－", width=3, style="Tool.TButton", command=lambda: self.set_zoom(self.zoom / 1.15)).pack(side="left")
-        self.zoom_lbl = tk.Label(inner, text="130%", width=5, bg=C["card"], fg=C["text"], font=UI["body"])
+        self.zoom_lbl = tk.Label(inner, text="130%", width=5, bg=C["card"], fg=C["text"], font=(FONT, 10))
         self.zoom_lbl.pack(side="left")
         ttk.Button(inner, text="＋", width=3, style="Tool.TButton", command=lambda: self.set_zoom(self.zoom * 1.15)).pack(side="left")
-        ttk.Button(inner, text="Fit width", style="Tool.TButton", command=self.fit_width).pack(side="left", padx=(ui_px(8), 0))
+        ttk.Button(inner, text="适应宽度", style="Tool.TButton", command=self.fit_width).pack(side="left", padx=(8, 18))
+        ttk.Button(inner, text="🔍 查找替换", style="Tool.TButton", command=self.find_replace).pack(side="left")
 
-        body = tk.PanedWindow(page, orient="horizontal", bg=C["bg"], borderwidth=0,
-                              sashwidth=ui_px(10), sashrelief="flat", opaqueresize=True)
-        body.pack(fill="both", expand=True, pady=(ui_px(12), 0))
+        body = tk.Frame(page, bg=C["bg"])
+        body.pack(fill="both", expand=True, pady=(12, 0))
 
-        # ---- Left: document canvas ----
+        # ---- 左: 画布 ----
         left = tk.Frame(body, bg=C["canvas"], highlightbackground=C["border"], highlightthickness=1)
-        body.add(left, minsize=ui_px(260), stretch="always")
+        left.pack(side="left", fill="both", expand=True)
         self.canvas = tk.Canvas(left, bg=C["canvas"], highlightthickness=0)
         vs = ttk.Scrollbar(left, orient="vertical", command=self.canvas.yview)
         hs = ttk.Scrollbar(left, orient="horizontal", command=self.canvas.xview)
@@ -1150,91 +1012,86 @@ class App:
         self.canvas.bind("<Button-4>", lambda e: self.on_wheel(e, 1))
         self.canvas.bind("<Button-5>", lambda e: self.on_wheel(e, -1))
         self.canvas.bind("<Enter>", lambda e: self.canvas.focus_set())
-        self.canvas.bind("<Configure>", lambda e: self.draw_placeholder() if self.view_doc is None else None)
         self.draw_placeholder()
 
-        # ---- Right: tools panel ----
-        right = tk.Frame(body, bg=C["bg"], width=ui_px(326))
-        body.add(right, minsize=ui_px(290), width=ui_px(326), stretch="never")
+        # ---- 右: 面板 ----
+        right = tk.Frame(body, bg=C["bg"], width=320)
+        right.pack(side="left", fill="y", padx=(12, 0))
         right.pack_propagate(False)
         sw = tk.Frame(right, bg=C["bg"])
         sw.pack(fill="x", pady=(0, 10))
         sw.columnconfigure((0, 1), weight=1, uniform="sw")
-        self.btn_tool_edit = ttk.Button(sw, text="Edit text", style="Accent.TButton", command=lambda: self.set_tool("edit"))
+        self.btn_tool_edit = ttk.Button(sw, text="✎ 编辑文字", style="Accent.TButton", command=lambda: self.set_tool("edit"))
         self.btn_tool_edit.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.btn_tool_sel = ttk.Button(sw, text="Select & copy", command=lambda: self.set_tool("select"))
+        self.btn_tool_sel = ttk.Button(sw, text="▭ 选择复制", command=lambda: self.set_tool("select"))
         self.btn_tool_sel.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         edit_panel = tk.Frame(right, bg=C["bg"])
         edit_panel.pack(fill="both", expand=True)
         self.edit_panel = edit_panel
         self.build_select_panel(right)
-        edit_content = scrollable_area(edit_panel)
 
-        guide = make_card(edit_content, "How to edit")
+        guide = make_card(edit_panel, "使用方法")
         guide.pack(fill="x")
-        wrapped_label(guide, text="Click text to edit. Enter confirms; Esc cancels.\nUse Shift+Enter for a paragraph line break."
-                      ).pack(fill="x", padx=ui_px(16), pady=(2, ui_px(12)))
+        tk.Label(guide, bg=C["card"], fg=C["sub"], font=(FONT, 9), justify="left", wraplength=265,
+                 text="点击页面文字 → 原位置出现输入框 → Enter 确认 (Esc 取消)。\n"
+                      "段落模式下 Shift+Enter 可强制换行。\n"
+                      "字体优先沿用原字体，行内的粗体/变色等局部样式会保留。"
+                 ).pack(anchor="w", padx=16, pady=(2, 12))
 
-        opt = make_card(edit_content, "Editing options")
+        opt = make_card(edit_panel, "编辑选项")
         opt.pack(fill="x", pady=(10, 0))
-        ttk.Label(opt, text="Edit unit", style="Sub.TLabel").pack(anchor="w", padx=16)
+        ttk.Label(opt, text="编辑粒度", style="Sub.TLabel").pack(anchor="w", padx=16)
         r = tk.Frame(opt, bg=C["card"])
         r.pack(anchor="w", padx=12, pady=(2, 4))
         self.mode_btns = []
-        for txt, val in (("Line", "line"), ("Span", "span"), ("Paragraph", "para")):
+        for txt, val in (("整行", "line"), ("片段", "span"), ("段落", "para")):
             rb = ttk.Radiobutton(r, text=txt, value=val, variable=self.mode_var, command=self.on_mode_change)
             rb.pack(side="left", padx=4)
             self.mode_btns.append(rb)
-        ttk.Checkbutton(opt, text="Auto-shrink long text", variable=self.fit_var,
+        ttk.Checkbutton(opt, text="超长时缩小字号以适应原区域", variable=self.fit_var,
                         command=self.refresh_view).pack(anchor="w", padx=16, pady=2)
-        ttk.Checkbutton(opt, text="Cover text on image backgrounds", variable=self.cover_var,
+        ttk.Checkbutton(opt, text="用背景色覆盖旧文字 (图片上的字用)", variable=self.cover_var,
                         command=self.refresh_view).pack(anchor="w", padx=16, pady=2)
         fr = tk.Frame(opt, bg=C["card"])
         fr.pack(fill="x", padx=16, pady=(4, 12))
-        ttk.Button(fr, text="Fallback font...", style="Tool.TButton", command=self.choose_font).pack(side="left")
-        self.font_lbl = wrapped_label(fr, text="Automatic")
-        self.font_lbl.pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(fr, text="备用字体…", style="Tool.TButton", command=self.choose_font).pack(side="left")
+        self.font_lbl = tk.Label(fr, text="未指定", bg=C["card"], fg=C["sub"], font=(FONT, 9))
+        self.font_lbl.pack(side="left", padx=8)
 
-        lst = make_card(edit_content, "Changes")
+        lst = make_card(edit_panel, "已修改的内容")
         lst.pack(fill="both", expand=True, pady=(10, 0))
         bt = tk.Frame(lst, bg=C["card"])
         bt.pack(side="bottom", fill="x", padx=12, pady=(0, 12))
-        tree_frame = tk.Frame(lst, bg=C["card"])
-        tree_frame.pack(fill="both", expand=True, padx=ui_px(12), pady=(4, 6))
-        self.tree = ttk.Treeview(tree_frame, columns=("p", "old", "new", "font"), show="headings", height=4, selectmode="browse")
-        self.tree.heading("p", text="Page")
-        self.tree.heading("old", text="Original")
-        self.tree.heading("new", text="New text")
-        self.tree.heading("font", text="Font")
-        self.tree.column("p", width=ui_px(44), anchor="center", stretch=False)
-        self.tree.column("old", width=ui_px(78))
-        self.tree.column("new", width=ui_px(78))
-        self.tree.column("font", width=ui_px(70), stretch=False)
-        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
-        tree_scroll.pack(side="right", fill="y")
-        self.tree.configure(yscrollcommand=tree_scroll.set)
-        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree = ttk.Treeview(lst, columns=("p", "old", "new", "font"), show="headings", height=4, selectmode="browse")
+        self.tree.heading("p", text="页")
+        self.tree.heading("old", text="原文")
+        self.tree.heading("new", text="修改后")
+        self.tree.heading("font", text="字体")
+        self.tree.column("p", width=28, anchor="center", stretch=False)
+        self.tree.column("old", width=82)
+        self.tree.column("new", width=82)
+        self.tree.column("font", width=76, stretch=False)
+        self.tree.pack(fill="both", expand=True, padx=12, pady=(4, 6))
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
-        ttk.Button(bt, text="Undo selected", style="Tool.TButton", command=self.undo_selected).pack(side="left")
-        ttk.Button(bt, text="Undo all", style="Tool.TButton", command=self.undo_all).pack(side="left", padx=6)
+        ttk.Button(bt, text="撤销所选", style="Tool.TButton", command=self.undo_selected).pack(side="left")
+        ttk.Button(bt, text="全部撤销", style="Tool.TButton", command=self.undo_all).pack(side="left", padx=6)
 
     def draw_placeholder(self):
         self.canvas.delete("all")
-        w, h = max(self.canvas.winfo_width(), 100), max(self.canvas.winfo_height(), 100)
-        self.canvas.create_text(w / 2, h / 2 - ui_px(18), text="Open a PDF to get started", font=UI["section"],
-                                fill=C["sub"], width=max(80, w - ui_px(40)), tags="ph")
-        self.canvas.create_text(w / 2, h / 2 + ui_px(14), text="Edit text or select and copy paragraphs", font=UI["caption"],
-                                fill=C["sub"], width=max(80, w - ui_px(40)), tags="ph")
+        w = max(self.canvas.winfo_width(), 600)
+        self.canvas.create_text(w / 2, 220, text="📄", font=(FONT, 54), fill="#9AA3B2", tags="ph")
+        self.canvas.create_text(w / 2, 300, text="点击左上角「打开」选择 PDF 文件", font=(FONT, 13), fill="#6B7280", tags="ph")
+        self.canvas.create_text(w / 2, 328, text="支持文字、中文、多页文档的原位修改", font=(FONT, 10), fill="#9AA3B2", tags="ph")
 
-    # ---------- Open / save ----------
+    # ---------- 打开 / 保存 ----------
     def open_pdf(self):
-        p = filedialog.askopenfilename(title="Open PDF", filetypes=[("PDF files", "*.pdf")])
+        p = filedialog.askopenfilename(title="打开 PDF", filetypes=[("PDF 文件", "*.pdf")])
         if not p:
             return
         try:
             doc = fitz.open(p)
             if not self.ask_password(doc, p):
-                messagebox.showerror("Error", "Incorrect password or canceled.")
+                messagebox.showerror("错误", "密码错误或已取消")
                 return
             self.src_bytes = doc.tobytes(encryption=fitz.PDF_ENCRYPT_NONE)
             doc.close()
@@ -1251,19 +1108,19 @@ class App:
             self.update_mode_lock()
             self.fit_width(render=False)
             self.render()
-            self.set_status(f"Opened {os.path.basename(p)} ({self.orig_doc.page_count} pages)")
+            self.set_status(f"已打开：{os.path.basename(p)}（共 {self.orig_doc.page_count} 页）")
         except Exception as ex:
-            messagebox.showerror("Error", f"Cannot open PDF: {ex}")
+            messagebox.showerror("错误", f"无法打开 PDF：{ex}")
 
     def save_pdf(self):
         if not self.orig_doc:
             return
         if not self.edits:
-            messagebox.showinfo("Notice", "No changes to save.\nClick text on a page to start editing.")
+            messagebox.showinfo("提示", "还没有任何修改。\n点击页面上的文字即可开始编辑。")
             return
         base = os.path.splitext(os.path.basename(self.src_path))[0]
         out = filedialog.asksaveasfilename(
-            defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")],
+            defaultextension=".pdf", filetypes=[("PDF 文件", "*.pdf")],
             initialfile=f"{base}_edited.pdf", initialdir=os.path.dirname(self.src_path))
         if not out:
             return
@@ -1274,19 +1131,19 @@ class App:
             doc.save(out, garbage=3, deflate=True)
             doc.close()
             self.busy(False)
-            msg = f"Saved {len(self.edits)} edits:\n{out}"
+            msg = f"已保存 {len(self.edits)} 处修改：\n{out}"
             alt = sum(1 for l in labels if l.startswith("≈"))
             if alt:
-                msg += f"\n\n{alt} edits use fallback fonts (marked with ≈). Choose a fallback font for a closer match."
+                msg += f"\n\n其中 {alt} 处无法完全沿用原字体（列表中标记为 ≈），可用「备用字体…」指定更接近的字体。"
             if warns:
-                msg += "\n\nNote: " + "; ".join(warns)
-            messagebox.showinfo("Saved", msg)
-            self.set_status(f"Saved: {out}")
+                msg += "\n\n提示：" + "；".join(warns)
+            messagebox.showinfo("保存成功", msg)
+            self.set_status(f"已保存：{out}")
         except Exception as ex:
             self.busy(False)
-            messagebox.showerror("Save failed", str(ex))
+            messagebox.showerror("保存失败", str(ex))
 
-    # ---------- Page rendering ----------
+    # ---------- 页面渲染 ----------
     def _page_from_entry(self):
         try:
             return int(self.page_entry.get()) - 1
@@ -1339,7 +1196,7 @@ class App:
         self.img_item = self.canvas.create_image(P, P, anchor="nw", image=self.tk_image)
         self.canvas.config(scrollregion=(0, 0, pix.width + 2 * P, pix.height + 2 * P))
         self.units = self.get_units()
-        # Edited text indicators
+        # 已修改标记
         for u in self.units:
             if (self.page_no, u["idx"]) in self.edits:
                 x0, y0, x1, y1 = self.to_canvas(u["bbox"])
@@ -1353,12 +1210,12 @@ class App:
         self.btn_next.config(state="normal" if self.page_no < n - 1 else "disabled")
         self.zoom_lbl.config(text=f"{int(self.zoom * 100)}%")
         if page.rotation != 0:
-            self.set_status("Text editing is unavailable on rotated pages.")
+            self.set_status("该页面带旋转属性，暂不支持文字编辑")
         elif not self.units:
-            self.set_status("This page has no editable text; it may be a scan or image.")
+            self.set_status("该页没有可编辑的文字（可能是扫描件 / 图片页）")
 
     def refresh_view(self):
-        """Rebuild the preview after edits or option changes."""
+        """编辑内容或选项变化后，重新生成预览"""
         if not self.orig_doc:
             return
         self.clear_selection(repaint=False)
@@ -1371,7 +1228,7 @@ class App:
                 for e, l in zip(vals, labels):
                     e["label"] = l
                 if warns:
-                    self.set_status("Note: " + "; ".join(warns))
+                    self.set_status("提示：" + "；".join(warns))
             finally:
                 self.busy(False)
         else:
@@ -1379,7 +1236,7 @@ class App:
         self.update_tree()
         self.render()
 
-    # ---------- Coordinates / hit testing ----------
+    # ---------- 坐标 / 命中 ----------
     def to_canvas(self, b):
         z, P = self.zoom, self.PAD
         return (P + b[0] * z, P + b[1] * z, P + b[2] * z, P + b[3] * z)
@@ -1428,40 +1285,35 @@ class App:
             self.canvas.yview_scroll(-d * 3, "units")
 
     # ============================================================
-    #  Selection and copy (drag area / click paragraph / Ctrl+A)
+    #  选择复制 (拖动框选 / 单击选段 / Ctrl+A 全选)
     # ============================================================
     def build_select_panel(self, parent):
         p = tk.Frame(parent, bg=C["bg"])
         self.select_panel = p
-        content = scrollable_area(p)
-        g = make_card(content, "Select and copy")
+        g = make_card(p, "文字选择与复制")
         g.pack(fill="x")
-        wrapped_label(g, text="Drag to select an area or click a paragraph.\nCtrl+A selects this page; Ctrl+C copies."
-                      ).pack(fill="x", padx=ui_px(16), pady=(2, 6))
-        ttk.Checkbutton(g, text="Merge paragraph line breaks", variable=self.merge_var,
+        tk.Label(g, bg=C["card"], fg=C["sub"], font=(FONT, 9), justify="left", wraplength=265,
+                 text="• 拖动鼠标框选区域\n• 单击一段文字，选中整段\n• Ctrl+A 全选本页，Ctrl+C 复制"
+                 ).pack(anchor="w", padx=16, pady=(2, 6))
+        ttk.Checkbutton(g, text="合并段内换行（整段连成一行）", variable=self.merge_var,
                         command=self.update_preview).pack(anchor="w", padx=16, pady=2)
-        ttk.Checkbutton(g, text="Copy automatically on selection", variable=self.autocopy_var).pack(anchor="w", padx=16, pady=(2, 12))
+        ttk.Checkbutton(g, text="选中后自动复制到剪贴板", variable=self.autocopy_var).pack(anchor="w", padx=16, pady=(2, 12))
 
-        card = make_card(content, "Selected text")
+        card = make_card(p, "选中的文字")
         card.pack(fill="both", expand=True, pady=(10, 0))
-        self.sel_info = wrapped_label(card, text="Nothing selected")
-        self.sel_info.pack(fill="x", padx=ui_px(16))
+        self.sel_info = tk.Label(card, text="尚未选择", bg=C["card"], fg=C["sub"], font=(FONT, 9))
+        self.sel_info.pack(anchor="w", padx=16)
         btns = tk.Frame(card, bg=C["card"])
         btns.pack(side="bottom", fill="x", padx=12, pady=(0, 12))
-        ttk.Button(btns, text="Copy", style="Accent.TButton", command=self.copy_selection).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
-        ttk.Button(btns, text="Copy page", style="Tool.TButton", command=self.copy_page).grid(row=1, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(btns, text="Copy all", style="Tool.TButton", command=self.copy_all).grid(row=1, column=1, sticky="ew", padx=4)
-        ttk.Button(btns, text="Clear", style="Tool.TButton", command=self.clear_selection).grid(row=1, column=2, sticky="ew", padx=(4, 0))
+        ttk.Button(btns, text="复制", style="Accent.TButton", command=self.copy_selection).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        ttk.Button(btns, text="复制整页", style="Tool.TButton", command=self.copy_page).grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(btns, text="复制全文", style="Tool.TButton", command=self.copy_all).grid(row=1, column=1, sticky="ew", padx=4)
+        ttk.Button(btns, text="清除", style="Tool.TButton", command=self.clear_selection).grid(row=1, column=2, sticky="ew", padx=(4, 0))
         for c in range(3):
             btns.columnconfigure(c, weight=1)
-        text_frame = tk.Frame(card, bg=C["card"])
-        text_frame.pack(fill="both", expand=True, padx=ui_px(12), pady=(6, ui_px(10)))
-        self.sel_text = tk.Text(text_frame, wrap="word", font=UI["body"], relief="flat", bg="#F9FAFB", fg=C["text"],
+        self.sel_text = tk.Text(card, wrap="word", font=(FONT, 10), relief="flat", bg="#F9FAFB", fg=C["text"],
                                 highlightthickness=1, highlightbackground=C["border"], padx=8, pady=6, height=8)
-        text_scroll = ttk.Scrollbar(text_frame, orient="vertical", command=self.sel_text.yview)
-        text_scroll.pack(side="right", fill="y")
-        self.sel_text.configure(yscrollcommand=text_scroll.set)
-        self.sel_text.pack(side="left", fill="both", expand=True)
+        self.sel_text.pack(fill="both", expand=True, padx=12, pady=(6, 10))
 
     def set_tool(self, tool):
         self.tool.set(tool)
@@ -1473,14 +1325,14 @@ class App:
             self.btn_tool_edit.config(style="Accent.TButton")
             self.btn_tool_sel.config(style="TButton")
             self.canvas.config(cursor="")
-            self.set_status("Edit mode: click page text to change it.")
+            self.set_status("编辑模式：点击页面文字进行修改")
         else:
             self.edit_panel.pack_forget()
             self.select_panel.pack(fill="both", expand=True)
             self.btn_tool_edit.config(style="TButton")
             self.btn_tool_sel.config(style="Accent.TButton")
             self.canvas.config(cursor="xterm")
-            self.set_status("Select mode: drag an area or click a paragraph.")
+            self.set_status("选择模式：拖动框选，或单击选中整段文字")
 
     def page_words(self):
         if self.words is None and self.view_doc:
@@ -1566,7 +1418,7 @@ class App:
         if self.rubber is not None:
             self.canvas.delete(self.rubber)
             self.rubber = None
-        if abs(ex - sx) < 4 and abs(ey - sy) < 4:  # Click -> select the full paragraph
+        if abs(ex - sx) < 4 and abs(ey - sy) < 4:  # 单击 -> 选中整段
             x, y = self._to_pdf(ex, ey)
             w = self.word_at(x, y)
             if w:
@@ -1605,7 +1457,7 @@ class App:
         self.sel_words, self.sel_rects = [], []
         if hasattr(self, "sel_text"):
             self.sel_text.delete("1.0", tk.END)
-            self.sel_info.config(text="Nothing selected")
+            self.sel_info.config(text="尚未选择")
         if repaint:
             self._repaint()
 
@@ -1615,7 +1467,7 @@ class App:
         text = words_to_text(self.sel_words, self.merge_var.get())
         self.sel_text.delete("1.0", tk.END)
         self.sel_text.insert("1.0", text)
-        self.sel_info.config(text=f"{len(text.replace(chr(10), ''))} characters selected. Edit below before copying.")
+        self.sel_info.config(text=f"已选中 {len(text.replace(chr(10), ''))} 个字符（可在下方直接修改后再复制）")
 
     def _clip(self, text, note):
         self.root.clipboard_clear()
@@ -1627,15 +1479,15 @@ class App:
         text = self.sel_text.get("1.0", "end-1c") if self.sel_words else ""
         if not text.strip():
             if not quiet:
-                self.set_status("Nothing selected. Drag an area or click a paragraph.")
+                self.set_status("还没有选中文字：拖动框选，或单击一段文字")
             return "break"
-        self._clip(text, f"Copied {len(text)} characters to the clipboard.")
+        self._clip(text, f"已复制 {len(text)} 个字符到剪贴板")
         return "break"
 
     def copy_page(self):
         if self.orig_doc:
             t = words_to_text(self.page_words(), self.merge_var.get())
-            self._clip(t, f"Copied page {self.page_no + 1} ({len(t)} characters).") if t.strip() else self.set_status("This page has no text to copy.")
+            self._clip(t, f"已复制第 {self.page_no + 1} 页全部文字（{len(t)} 个字符）") if t.strip() else self.set_status("该页没有可复制的文字")
 
     def copy_all(self):
         if not self.view_doc:
@@ -1646,9 +1498,9 @@ class App:
             if ws:
                 parts.append(words_to_text(ws, self.merge_var.get()))
         t = "\n\n".join(parts)
-        self._clip(t, f"Copied all text ({self.view_doc.page_count} pages, {len(t)} characters).") if t.strip() else self.set_status("This document has no text to copy.")
+        self._clip(t, f"已复制全文（{self.view_doc.page_count} 页，{len(t)} 个字符）") if t.strip() else self.set_status("文档里没有可复制的文字")
 
-    # ---------- In-place editing ----------
+    # ---------- 就地编辑 ----------
     def on_click(self, ev):
         if not self.orig_doc:
             return
@@ -1691,7 +1543,7 @@ class App:
         self.entry.bind("<Escape>", lambda e: self.cancel_entry())
         self.entry.bind("<FocusOut>", lambda e: self.root.after(60, self.commit_entry))
         self.set_hover(None)
-        self.set_status("Press Enter to confirm or Esc to cancel." + (" Shift+Enter inserts a line break." if para else ""))
+        self.set_status("修改后按 Enter 确认，Esc 取消" + ("；Shift+Enter 换行" if para else ""))
 
     def cancel_entry(self):
         if self.entry:
@@ -1708,10 +1560,10 @@ class App:
         if self.set_edit(key[0], u, new):
             self.update_mode_lock()
             self.refresh_view()
-            self.set_status(f"{len(self.edits)} edits pending. Use Save as... when finished.")
+            self.set_status(f"已修改 {len(self.edits)} 处，完成后点击「保存为…」")
 
     def set_edit(self, page_no, u, new):
-        """Record one edit and return whether it changed."""
+        """登记一处修改, 返回是否有变化"""
         key = (page_no, u["idx"])
         old = self.edits.get(key)
         prev = old["new"] if old else u["text"]
@@ -1726,32 +1578,31 @@ class App:
             self.edit_order.append(key)
         return True
 
-    # ---------- Find and replace ----------
+    # ---------- 查找替换 ----------
     def find_replace(self):
         if not self.orig_doc:
-            messagebox.showinfo("Notice", "Open a PDF first.")
+            messagebox.showinfo("提示", "请先打开 PDF")
             return
         self.cancel_entry()
         dlg = tk.Toplevel(self.root)
-        dlg.title("Find and replace")
+        dlg.title("查找替换")
         dlg.configure(bg=C["card"])
         dlg.transient(self.root)
         dlg.resizable(False, False)
         dlg.geometry(f"+{self.root.winfo_rootx() + 300}+{self.root.winfo_rooty() + 160}")
         body = tk.Frame(dlg, bg=C["card"])
         body.pack(padx=22, pady=18)
-        tk.Label(body, text="Find", bg=C["card"], fg=C["sub"]).grid(row=0, column=0, sticky="w", pady=6)
+        tk.Label(body, text="查找", bg=C["card"], fg=C["sub"]).grid(row=0, column=0, sticky="w", pady=6)
         e1 = ttk.Entry(body, width=36)
         e1.grid(row=0, column=1, padx=(12, 0))
-        tk.Label(body, text="Replace with", bg=C["card"], fg=C["sub"]).grid(row=1, column=0, sticky="w", pady=6)
+        tk.Label(body, text="替换为", bg=C["card"], fg=C["sub"]).grid(row=1, column=0, sticky="w", pady=6)
         e2 = ttk.Entry(body, width=36)
         e2.grid(row=1, column=1, padx=(12, 0))
         case = tk.BooleanVar(value=True)
-        ttk.Checkbutton(body, text="Match case", variable=case).grid(row=2, column=1, sticky="w", pady=4)
-        tk.Label(body, text="Scope: all pages. Match the current edit unit; use Paragraph for multiline text.",
-                 bg=C["card"], fg=C["sub"], font=UI["caption"], wraplength=ui_px(420),
-                 justify="left").grid(row=3, column=0, columnspan=2, sticky="w")
-        res = tk.Label(body, text="", bg=C["card"], fg=C["ok"], font=UI["caption"])
+        ttk.Checkbutton(body, text="区分大小写", variable=case).grid(row=2, column=1, sticky="w", pady=4)
+        tk.Label(body, text="范围：全部页面（按当前编辑粒度匹配，跨行的文字请用「段落」粒度）",
+                 bg=C["card"], fg=C["sub"], font=(FONT, 9)).grid(row=3, column=0, columnspan=2, sticky="w")
+        res = tk.Label(body, text="", bg=C["card"], fg=C["ok"], font=(FONT, 9))
         res.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         def go():
@@ -1770,26 +1621,26 @@ class App:
             if n_hits:
                 self.update_mode_lock()
                 self.refresh_view()
-                res.config(text=f"Replaced {n_hits} matches in {n_units} text units.", fg=C["ok"])
-                self.set_status(f"Find and replace: {n_hits} matches replaced.")
+                res.config(text=f"已替换 {n_hits} 处（涉及 {n_units} 个文本块）", fg=C["ok"])
+                self.set_status(f"查找替换完成：{n_hits} 处")
             else:
-                res.config(text="No matching text found.", fg="#DC2626")
+                res.config(text="没有找到匹配的文字", fg="#DC2626")
         bt = tk.Frame(dlg, bg=C["card"])
         bt.pack(fill="x", padx=22, pady=(0, 18))
-        ttk.Button(bt, text="Replace all", style="Accent.TButton", command=go).pack(side="right")
-        ttk.Button(bt, text="Close", command=dlg.destroy).pack(side="right", padx=8)
+        ttk.Button(bt, text="全部替换", style="Accent.TButton", command=go).pack(side="right")
+        ttk.Button(bt, text="关闭", command=dlg.destroy).pack(side="right", padx=8)
         e1.focus_set()
         dlg.bind("<Return>", lambda e: go())
 
     def choose_font(self):
-        p = filedialog.askopenfilename(title="Choose a fallback font for missing glyphs",
-                                       filetypes=[("Font files", "*.ttf *.ttc *.otf"), ("All files", "*.*")])
+        p = filedialog.askopenfilename(title="选择备用字体（原字体缺字时使用）",
+                                       filetypes=[("字体文件", "*.ttf *.ttc *.otf"), ("所有文件", "*.*")])
         if p:
             self.user_font = p
             self.font_lbl.config(text=os.path.basename(p))
             self.refresh_view()
 
-    # ---------- Change list / undo ----------
+    # ---------- 修改列表 / 撤销 ----------
     def update_tree(self):
         self.tree.delete(*self.tree.get_children())
         for key in self.edit_order:
@@ -1822,7 +1673,7 @@ class App:
             self.after_undo()
 
     def undo_all(self):
-        if self.edits and messagebox.askyesno("Confirm", "Undo all changes?"):
+        if self.edits and messagebox.askyesno("确认", "撤销所有修改？"):
             self.edits.clear()
             self.edit_order.clear()
             self.after_undo()
@@ -1843,41 +1694,34 @@ class App:
             rb.config(state=st)
 
     # ============================================================
-    #  2. Merge PDFs
+    #  2. 合并
     # ============================================================
     def build_merge(self):
         page = self.page_frame("merge")
-        card = make_card(page, "Files in merge order")
+        card = make_card(page, "文件列表（按顺序合并）")
         card.pack(fill="both", expand=True)
         tb = tk.Frame(card, bg=C["card"])
         tb.pack(fill="x", padx=14, pady=(6, 8))
-        ttk.Button(tb, text="Add files", command=self.merge_add).pack(side="left")
-        ttk.Button(tb, text="Move up", style="Tool.TButton", command=lambda: self.merge_move(-1)).pack(side="left", padx=(14, 4))
-        ttk.Button(tb, text="Move down", style="Tool.TButton", command=lambda: self.merge_move(1)).pack(side="left", padx=4)
-        ttk.Button(tb, text="Remove", style="Tool.TButton", command=self.merge_remove).pack(side="left", padx=4)
-        ttk.Button(tb, text="Clear", style="Tool.TButton", command=lambda: self.merge_tree.delete(*self.merge_tree.get_children())).pack(side="left", padx=4)
-        ttk.Button(tb, text="Merge PDFs", style="Accent.TButton", command=self.merge_run).pack(side="right")
-        table = tk.Frame(card, bg=C["card"])
-        table.pack(fill="both", expand=True, padx=ui_px(14), pady=(0, ui_px(14)))
-        self.merge_tree = ttk.Treeview(table, columns=("name", "pages", "path"), show="headings", selectmode="extended")
-        self.merge_tree.heading("name", text="File name")
-        self.merge_tree.heading("pages", text="Pages")
-        self.merge_tree.heading("path", text="Path")
-        self.merge_tree.column("name", width=ui_px(230), minwidth=ui_px(120))
-        self.merge_tree.column("pages", width=ui_px(60), anchor="center", stretch=False)
-        self.merge_tree.column("path", width=ui_px(400), minwidth=ui_px(180))
-        vbar = ttk.Scrollbar(table, orient="vertical", command=self.merge_tree.yview)
-        hbar = ttk.Scrollbar(table, orient="horizontal", command=self.merge_tree.xview)
-        vbar.pack(side="right", fill="y")
-        hbar.pack(side="bottom", fill="x")
-        self.merge_tree.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
-        self.merge_tree.pack(side="left", fill="both", expand=True)
+        ttk.Button(tb, text="＋ 添加文件", command=self.merge_add).pack(side="left")
+        ttk.Button(tb, text="↑ 上移", style="Tool.TButton", command=lambda: self.merge_move(-1)).pack(side="left", padx=(14, 4))
+        ttk.Button(tb, text="↓ 下移", style="Tool.TButton", command=lambda: self.merge_move(1)).pack(side="left", padx=4)
+        ttk.Button(tb, text="移除", style="Tool.TButton", command=self.merge_remove).pack(side="left", padx=4)
+        ttk.Button(tb, text="清空", style="Tool.TButton", command=lambda: self.merge_tree.delete(*self.merge_tree.get_children())).pack(side="left", padx=4)
+        ttk.Button(tb, text="开始合并", style="Accent.TButton", command=self.merge_run).pack(side="right")
+        self.merge_tree = ttk.Treeview(card, columns=("name", "pages", "path"), show="headings", selectmode="extended")
+        self.merge_tree.heading("name", text="文件名")
+        self.merge_tree.heading("pages", text="页数")
+        self.merge_tree.heading("path", text="路径")
+        self.merge_tree.column("name", width=280)
+        self.merge_tree.column("pages", width=70, anchor="center", stretch=False)
+        self.merge_tree.column("path", width=500)
+        self.merge_tree.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
     def merge_add(self):
-        for f in filedialog.askopenfilenames(title="Choose PDF", filetypes=[("PDF files", "*.pdf")]):
+        for f in filedialog.askopenfilenames(title="选择 PDF", filetypes=[("PDF 文件", "*.pdf")]):
             try:
                 with fitz.open(f) as d:
-                    n = "Encrypted" if d.needs_pass else d.page_count
+                    n = "加密" if d.needs_pass else d.page_count
             except Exception:
                 n = "?"
             self.merge_tree.insert("", "end", values=(os.path.basename(f), n, f))
@@ -1896,9 +1740,9 @@ class App:
     def merge_run(self):
         files = [self.merge_tree.item(i, "values")[2] for i in self.merge_tree.get_children()]
         if len(files) < 2:
-            messagebox.showinfo("Notice", "Add at least two PDF files.")
+            messagebox.showinfo("提示", "请至少添加两个 PDF 文件")
             return
-        out = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")], initialfile="merged.pdf")
+        out = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF 文件", "*.pdf")], initialfile="merged.pdf")
         if not out:
             return
         try:
@@ -1907,54 +1751,53 @@ class App:
             for f in files:
                 with fitz.open(f) as src:
                     if not self.ask_password(src, f):
-                        raise ValueError(f"Cannot open encrypted PDF: {os.path.basename(f)}")
+                        raise ValueError(f"无法打开加密文件：{os.path.basename(f)}")
                     res.insert_pdf(src)
             res.save(out, garbage=3, deflate=True)
             res.close()
             self.busy(False)
-            self.set_status(f"Merged {len(files)} files: {out}")
-            messagebox.showinfo("Success", f"Merged {len(files)} files:\n{out}")
+            self.set_status(f"已合并 {len(files)} 个文件 → {out}")
+            messagebox.showinfo("成功", f"已合并 {len(files)} 个文件：\n{out}")
         except Exception as ex:
             self.busy(False)
-            messagebox.showerror("Merge failed", str(ex))
+            messagebox.showerror("合并失败", str(ex))
 
     # ============================================================
-    #  3. Split PDF
+    #  3. 拆分
     # ============================================================
     def build_split(self):
         page = self.page_frame("split")
-        card = make_card(page, "Choose file")
+        card = make_card(page, "选择文件")
         card.pack(fill="x")
         self.split_var = tk.StringVar()
         self.split_info = tk.StringVar(value="")
         self.file_row(card, self.split_var, lambda: self.pick_pdf(self.split_var, self.split_loaded))
-        tk.Label(card, textvariable=self.split_info, bg=C["card"], fg=C["sub"], font=UI["caption"]).pack(anchor="w", padx=16, pady=(0, 10))
+        tk.Label(card, textvariable=self.split_info, bg=C["card"], fg=C["sub"], font=(FONT, 9)).pack(anchor="w", padx=16, pady=(0, 10))
 
-        c2 = make_card(page, "Page settings")
+        c2 = make_card(page, "页码设置")
         c2.pack(fill="x", pady=(12, 0))
-        wrapped_label(c2, text="Page range, e.g. 1-3,5,8-. An open end includes the last page."
-                      ).pack(fill="x", padx=ui_px(16))
+        tk.Label(c2, text="页码范围（例：1-3,5,8-，留空尾部表示到末页）", bg=C["card"], fg=C["sub"], font=(FONT, 9)).pack(anchor="w", padx=16)
         self.split_range = ttk.Entry(c2)
         self.split_range.pack(fill="x", padx=16, pady=(4, 10))
         self.split_range.insert(0, "1-")
         self.split_mode = tk.StringVar(value="one")
         r = tk.Frame(c2, bg=C["card"])
         r.pack(anchor="w", padx=12, pady=(0, 14))
-        ttk.Radiobutton(r, text="Extract to one PDF", value="one", variable=self.split_mode).pack(side="left", padx=4)
-        ttk.Radiobutton(r, text="Save each page separately", value="each", variable=self.split_mode).pack(side="left", padx=14)
-        ttk.Button(page, text="Split PDF", style="Accent.TButton", command=self.split_run).pack(anchor="e", pady=14)
+        ttk.Radiobutton(r, text="提取为一个新文件", value="one", variable=self.split_mode).pack(side="left", padx=4)
+        ttk.Radiobutton(r, text="每页单独保存", value="each", variable=self.split_mode).pack(side="left", padx=14)
+        ttk.Button(page, text="开始拆分", style="Accent.TButton", command=self.split_run).pack(anchor="e", pady=14)
 
     def split_loaded(self, p):
         try:
             with fitz.open(p) as d:
-                self.split_info.set(f"{d.page_count} pages" if not d.needs_pass else "Encrypted PDF. Unlock it in Security first.")
+                self.split_info.set(f"共 {d.page_count} 页" if not d.needs_pass else "文件已加密，请先到「加密/解密」页解锁")
         except Exception as ex:
             self.split_info.set(str(ex))
 
     def split_run(self):
         f = self.split_var.get()
         if not f:
-            messagebox.showinfo("Notice", "Choose a PDF file first.")
+            messagebox.showinfo("提示", "请先选择 PDF 文件")
             return
         try:
             src = fitz.open(f)
@@ -1963,7 +1806,7 @@ class App:
             self.busy()
             if self.split_mode.get() == "one":
                 self.busy(False)
-                out = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")], initialfile=f"{base}_extract.pdf")
+                out = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF 文件", "*.pdf")], initialfile=f"{base}_extract.pdf")
                 if not out:
                     return
                 self.busy()
@@ -1972,7 +1815,7 @@ class App:
                 msg = out
             else:
                 self.busy(False)
-                folder = filedialog.askdirectory(title="Choose output folder")
+                folder = filedialog.askdirectory(title="选择输出文件夹")
                 if not folder:
                     return
                 self.busy()
@@ -1981,329 +1824,114 @@ class App:
                     d.insert_pdf(src, from_page=p, to_page=p)
                     d.save(os.path.join(folder, f"{base}_page{p + 1}.pdf"))
                     d.close()
-                msg = f"{folder} ({len(pages)} files)"
+                msg = f"{folder}（{len(pages)} 个文件）"
             src.close()
             self.busy(False)
-            self.set_status("Split complete")
-            messagebox.showinfo("Success", f"Split complete:\n{msg}")
+            self.set_status("拆分完成")
+            messagebox.showinfo("成功", f"拆分完成：\n{msg}")
         except Exception as ex:
             self.busy(False)
-            messagebox.showerror("Split failed", str(ex))
+            messagebox.showerror("拆分失败", str(ex))
 
     # ============================================================
-    #  4. Watermark
+    #  4. 水印
     # ============================================================
     def build_watermark(self):
         page = self.page_frame("wm")
-        self.wm_doc = None
-        self.wm_loaded_path = None
-        self.wm_page_no = 0
-        self.wm_tk_image = None
-        self.wm_preview_job = None
-        self.wm_kit = FontKit()
-        self.root.bind("<Destroy>", self.wm_cleanup, add="+")
-
-        card = make_card(page, "PDF files")
+        card = make_card(page, "选择文件")
         card.pack(fill="x")
         self.wm_var = tk.StringVar()
-        self.file_row(card, self.wm_var, lambda: self.pick_pdf(self.wm_var, self.wm_load_pdf))
-        body = tk.Frame(page, bg=C["bg"])
-        body.pack(fill="both", expand=True, pady=(ui_px(12), 0))
-        body.columnconfigure(0, minsize=ui_px(282))
-        body.columnconfigure(1, weight=1)
-        body.rowconfigure(0, weight=1)
+        self.file_row(card, self.wm_var, lambda: self.pick_pdf(self.wm_var))
 
-        settings = make_card(body, "Watermark settings")
-        settings.grid(row=0, column=0, sticky="nsew", padx=(0, ui_px(12)))
-        actions = tk.Frame(settings, bg=C["card"])
-        actions.pack(side="bottom", fill="x", padx=ui_px(16), pady=(ui_px(10), ui_px(14)))
-        ttk.Button(actions, text="Save watermarked PDF", style="Accent.TButton",
-                   command=self.wm_run).pack(fill="x")
-        wrapped_label(actions, text="Saving adds the watermark to every page."
-                      ).pack(fill="x", pady=(ui_px(6), 0))
-        content = scrollable_area(settings)
-        form = tk.Frame(content, bg=C["card"])
-        form.pack(fill="x", padx=ui_px(16), pady=(ui_px(6), ui_px(12)))
-
-        tk.Label(form, text="Watermark text", bg=C["card"], fg=C["text"],
-                 font=UI["body"]).pack(anchor="w", pady=(0, ui_px(5)))
-        self.wm_text_var = tk.StringVar(value="CONFIDENTIAL")
-        self.wm_text = ttk.Entry(form, textvariable=self.wm_text_var, width=22)
-        self.wm_text.pack(fill="x")
-
-        numbers = tk.Frame(form, bg=C["card"])
-        numbers.pack(fill="x", pady=(ui_px(14), ui_px(12)))
-        numbers.columnconfigure((0, 1), weight=1, uniform="wm_numbers")
+        c2 = make_card(page, "水印设置")
+        c2.pack(fill="x", pady=(12, 0))
+        g = tk.Frame(c2, bg=C["card"])
+        g.pack(fill="x", padx=16, pady=(6, 14))
+        g.columnconfigure(1, weight=1)
+        lab = lambda t, r: tk.Label(g, text=t, bg=C["card"], fg=C["sub"], font=(FONT, 10)).grid(row=r, column=0, sticky="w", pady=7, padx=(0, 16))
+        lab("水印文字", 0)
+        self.wm_text = ttk.Entry(g)
+        self.wm_text.grid(row=0, column=1, sticky="ew")
+        self.wm_text.insert(0, "CONFIDENTIAL 机密")
+        lab("字号", 1)
         self.wm_size = tk.IntVar(value=48)
+        ttk.Spinbox(g, from_=10, to=200, textvariable=self.wm_size, width=8).grid(row=1, column=1, sticky="w")
+        lab("旋转角度", 2)
         self.wm_angle = tk.IntVar(value=45)
-        for col, (title, var, low, high) in enumerate((
-                ("Font size (pt)", self.wm_size, 10, 200),
-                ("Angle (°)", self.wm_angle, 0, 90))):
-            field = tk.Frame(numbers, bg=C["card"])
-            field.grid(row=0, column=col, sticky="ew", padx=(0, ui_px(10)) if col == 0 else 0)
-            tk.Label(field, text=title, bg=C["card"], fg=C["text"],
-                     font=UI["body"]).pack(anchor="w", pady=(0, ui_px(5)))
-            ttk.Spinbox(field, from_=low, to=high, textvariable=var, width=6).pack(fill="x")
-
-        opacity_head = tk.Frame(form, bg=C["card"])
-        opacity_head.pack(fill="x")
-        tk.Label(opacity_head, text="Opacity", bg=C["card"], fg=C["text"],
-                 font=UI["body"]).pack(side="left")
+        ttk.Spinbox(g, from_=0, to=90, textvariable=self.wm_angle, width=8).grid(row=2, column=1, sticky="w")
+        lab("透明度", 3)
         self.wm_op = tk.DoubleVar(value=0.25)
-        self.wm_op_text = tk.StringVar(value="25%")
-        tk.Label(opacity_head, textvariable=self.wm_op_text, bg=C["card"], fg=C["accent"],
-                 font=UI["body"]).pack(side="right")
-        ttk.Scale(form, from_=0.05, to=1.0, variable=self.wm_op).pack(fill="x", pady=(ui_px(6), ui_px(12)))
-        tk.Label(form, text="Color", bg=C["card"], fg=C["text"],
-                 font=UI["body"]).pack(anchor="w", pady=(0, ui_px(5)))
-        self.wm_color = tk.StringVar(value="Gray")
-        ttk.Combobox(form, textvariable=self.wm_color, values=["Gray", "Red", "Blue", "Black"],
-                     state="readonly", width=10).pack(fill="x")
+        ttk.Scale(g, from_=0.05, to=1.0, variable=self.wm_op).grid(row=3, column=1, sticky="ew", pady=7)
+        lab("颜色", 4)
+        self.wm_color = tk.StringVar(value="灰色")
+        ttk.Combobox(g, textvariable=self.wm_color, values=["灰色", "红色", "蓝色", "黑色"], state="readonly", width=10).grid(row=4, column=1, sticky="w")
         self.wm_tile = tk.BooleanVar(value=False)
-        ttk.Checkbutton(form, text="Tile across page", variable=self.wm_tile).pack(anchor="w", pady=(ui_px(14), 0))
-
-        preview = make_card(body, "Preview")
-        preview.grid(row=0, column=1, sticky="nsew")
-        toolbar = tk.Frame(preview, bg=C["card"])
-        toolbar.pack(fill="x", padx=ui_px(12), pady=(ui_px(6), ui_px(4)))
-        self.wm_prev = ttk.Button(toolbar, text="Previous", style="Tool.TButton",
-                                  state="disabled", command=lambda: self.wm_goto(self.wm_page_no - 1))
-        self.wm_prev.pack(side="left")
-        self.wm_page_var = tk.StringVar(value="1")
-        self.wm_page_entry = ttk.Entry(toolbar, textvariable=self.wm_page_var, width=4,
-                                      justify="center", state="disabled")
-        self.wm_page_entry.pack(side="left", padx=(ui_px(8), 2))
-        self.wm_page_entry.bind("<Return>", self.wm_page_from_entry)
-        self.wm_total = tk.Label(toolbar, text="/ 0", bg=C["card"], fg=C["sub"], font=UI["body"])
-        self.wm_total.pack(side="left", padx=(0, ui_px(8)))
-        self.wm_next = ttk.Button(toolbar, text="Next", style="Tool.TButton",
-                                  state="disabled", command=lambda: self.wm_goto(self.wm_page_no + 1))
-        self.wm_next.pack(side="left")
-        ttk.Button(toolbar, text="Refresh", style="Tool.TButton",
-                   command=lambda: self.wm_schedule_preview(0)).pack(side="right")
-        self.wm_show = tk.BooleanVar(value=True)
-        ttk.Checkbutton(preview, text="Show watermark (uncheck to compare original)",
-                        variable=self.wm_show).pack(anchor="w", padx=ui_px(12), pady=(ui_px(4), ui_px(8)))
-        self.wm_preview_info = tk.StringVar(value="Choose a PDF file to preview the watermark.")
-        wrapped_label(preview, textvariable=self.wm_preview_info
-                      ).pack(side="bottom", fill="x", padx=ui_px(12), pady=ui_px(8))
-        self.wm_canvas = tk.Canvas(preview, bg=C["canvas"], highlightthickness=0, width=1, height=1)
-        self.wm_canvas.pack(fill="both", expand=True, padx=ui_px(12))
-        self.wm_canvas.bind("<Configure>", lambda e: self.wm_schedule_preview())
-
-        self.wm_op.trace_add("write", self.wm_update_opacity)
-        for var in (self.wm_text_var, self.wm_size, self.wm_angle, self.wm_op,
-                    self.wm_color, self.wm_tile, self.wm_show):
-            var.trace_add("write", lambda *args: self.wm_schedule_preview())
-
-    def wm_update_opacity(self, *args):
-        try:
-            self.wm_op_text.set(f"{self.wm_op.get():.0%}")
-        except (ValueError, tk.TclError):
-            self.wm_op_text.set("—")
-
-    def wm_cleanup(self, event=None):
-        if event is not None and event.widget is not self.root:
-            return
-        if self.wm_preview_job is not None:
-            self.root.after_cancel(self.wm_preview_job)
-            self.wm_preview_job = None
-        if self.wm_doc is not None:
-            self.wm_doc.close()
-            self.wm_doc = None
-        self.wm_kit.close()
-
-    def wm_load_pdf(self, path):
-        self.wm_cleanup()
-        self.wm_loaded_path = None
-        self.wm_page_no = 0
-        self.wm_kit = FontKit()
-        self.wm_update_navigation()
-        self.wm_placeholder("Loading PDF...")
-        doc = None
-        try:
-            # Keep a snapshot matching the preview without locking the source file.
-            with open(path, "rb") as source:
-                doc = fitz.open(stream=source.read(), filetype="pdf")
-            if not self.ask_password(doc, path):
-                self.wm_placeholder("Incorrect password or canceled. Choose the file again.")
-                return False
-            if not doc.page_count:
-                raise ValueError("The PDF has no pages to preview.")
-            self.wm_doc, doc = doc, None
-            self.wm_loaded_path = path
-            self.wm_update_navigation()
-            self.wm_schedule_preview(0)
-            return True
-        except Exception as ex:
-            self.wm_placeholder(f"Cannot open PDF: {ex}")
-            messagebox.showerror("Cannot open PDF", str(ex))
-            return False
-        finally:
-            if doc is not None:
-                doc.close()
-
-    def wm_update_navigation(self):
-        n = self.wm_doc.page_count if self.wm_doc is not None else 0
-        self.wm_page_var.set(str(self.wm_page_no + 1))
-        self.wm_total.config(text=f"/ {n}")
-        self.wm_page_entry.config(state="normal" if n else "disabled")
-        self.wm_prev.config(state="normal" if n and self.wm_page_no > 0 else "disabled")
-        self.wm_next.config(state="normal" if n and self.wm_page_no < n - 1 else "disabled")
-
-    def wm_goto(self, n):
-        if self.wm_doc is None:
-            return
-        self.wm_page_no = max(0, min(n, self.wm_doc.page_count - 1))
-        self.wm_update_navigation()
-        self.wm_schedule_preview(0)
-
-    def wm_page_from_entry(self, event=None):
-        try:
-            self.wm_goto(int(self.wm_page_var.get()) - 1)
-        except ValueError:
-            self.wm_update_navigation()
-        return "break"
-
-    def wm_schedule_preview(self, delay=250):
-        # Debounce typing, slider movements, and resizes to avoid redundant rendering.
-        if self.wm_preview_job is not None:
-            self.root.after_cancel(self.wm_preview_job)
-            self.wm_preview_job = None
-        if self.cur == "wm":
-            self.wm_preview_job = self.root.after(delay, self.wm_render_preview)
-
-    def wm_options(self, require_text=False):
-        text = self.wm_text.get().strip()
-        if require_text and not text:
-            raise ValueError("Enter watermark text.")
-        try:
-            size, angle, opacity = self.wm_size.get(), self.wm_angle.get(), float(self.wm_op.get())
-        except (ValueError, tk.TclError):
-            raise ValueError("Enter a valid font size, angle, and opacity.") from None
-        if not 10 <= size <= 200:
-            raise ValueError("Font size must be between 10 and 200 pt.")
-        if not 0 <= angle <= 90:
-            raise ValueError("Angle must be between 0 and 90 degrees.")
-        if not 0.05 <= opacity <= 1:
-            raise ValueError("Opacity must be between 5% and 100%.")
-        colors = {"Gray": (0.45, 0.45, 0.45), "Red": (0.85, 0.1, 0.1),
-                  "Blue": (0.1, 0.3, 0.85), "Black": (0, 0, 0)}
-        return dict(text=text, size=size, opacity=opacity, angle=angle,
-                    color=colors[self.wm_color.get()], tile=self.wm_tile.get())
-
-    def wm_placeholder(self, message):
-        self.wm_tk_image = None
-        self.wm_canvas.delete("all")
-        self.wm_canvas.create_text(max(self.wm_canvas.winfo_width(), 100) / 2,
-                                   max(self.wm_canvas.winfo_height(), 100) / 2,
-                                   text=message, fill=C["sub"], font=(FONT, 11),
-                                   width=max(self.wm_canvas.winfo_width() - 32, 100),
-                                   justify="center")
-        self.wm_preview_info.set(message)
-
-    def wm_render_preview(self):
-        self.wm_preview_job = None
-        if self.cur != "wm":
-            return
-        if self.wm_doc is None:
-            self.wm_placeholder("Choose a PDF file to preview the watermark.")
-            return
-        try:
-            options = self.wm_options()
-            show = self.wm_show.get() and bool(options["text"])
-            # Start from the original page so settings never accumulate watermarks.
-            with fitz.open() as preview:
-                preview.insert_pdf(self.wm_doc, from_page=self.wm_page_no, to_page=self.wm_page_no)
-                pg = preview[0]
-                if show:
-                    add_watermark(pg, self.wm_kit, **options)
-                cw, ch = self.wm_canvas.winfo_width(), self.wm_canvas.winfo_height()
-                margin = ui_px(16)
-                if cw < margin * 2 + 8 or ch < margin * 2 + 8:
-                    return  # Wait for a Configure event after the canvas is laid out.
-                z = min((cw - margin * 2) / pg.rect.width, (ch - margin * 2) / pg.rect.height, 2.0 * UI_SCALE)
-                pix = pg.get_pixmap(matrix=fitz.Matrix(z, z), colorspace=fitz.csRGB, alpha=False)
-                img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            self.wm_tk_image = ImageTk.PhotoImage(img, master=self.root)
-            self.wm_canvas.delete("all")
-            x, y = (cw - pix.width) / 2, (ch - pix.height) / 2
-            self.wm_canvas.create_rectangle(x + 4, y + 4, x + pix.width + 4, y + pix.height + 4,
-                                            fill="#B8BFCB", outline="")
-            self.wm_canvas.create_image(x, y, anchor="nw", image=self.wm_tk_image)
-            kind = "Watermarked" if show else "Original"
-            self.wm_preview_info.set(f"Page {self.wm_page_no + 1} / {self.wm_doc.page_count} · {kind}")
-        except Exception as ex:
-            self.wm_placeholder(f"Preview unavailable: {ex}")
+        ttk.Checkbutton(g, text="平铺整页", variable=self.wm_tile).grid(row=5, column=1, sticky="w", pady=(8, 0))
+        ttk.Button(page, text="添加水印并保存", style="Accent.TButton", command=self.wm_run).pack(anchor="e", pady=14)
 
     def wm_run(self):
-        f = self.wm_var.get()
-        if not f:
-            messagebox.showinfo("Notice", "Choose a PDF file first.")
-            return
-        if self.wm_doc is None or self.wm_loaded_path != f:
-            if not self.wm_load_pdf(f):
-                return
-        try:
-            options = self.wm_options(require_text=True)
-        except ValueError as ex:
-            messagebox.showinfo("Notice", str(ex))
+        f, text = self.wm_var.get(), self.wm_text.get().strip()
+        if not f or not text:
+            messagebox.showinfo("提示", "请选择文件并输入水印文字")
             return
         base = os.path.splitext(os.path.basename(f))[0]
-        out = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")], initialfile=f"{base}_watermark.pdf")
+        out = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF 文件", "*.pdf")], initialfile=f"{base}_watermark.pdf")
         if not out:
             return
+        colors = {"灰色": (0.45, 0.45, 0.45), "红色": (0.85, 0.1, 0.1), "蓝色": (0.1, 0.3, 0.85), "黑色": (0, 0, 0)}
         try:
             self.busy()
-            # Keep the source read-only; save and preview share fonts, parameters, and drawing.
-            with fitz.open(stream=self.wm_doc.tobytes(encryption=fitz.PDF_ENCRYPT_NONE), filetype="pdf") as doc:
-                for pg in doc:
-                    add_watermark(pg, self.wm_kit, **options)
-                doc.save(out, garbage=3, deflate=True)
-            self.set_status(f"Watermarked PDF saved: {out}")
-            messagebox.showinfo("Success", f"Watermarked PDF saved:\n{out}")
-        except Exception as ex:
-            messagebox.showerror("Failed", str(ex))
-        finally:
+            doc = fitz.open(f)
+            if not self.ask_password(doc, f):
+                raise ValueError("无法打开加密文件")
+            kit = FontKit()
+            for pg in doc:
+                add_watermark(pg, kit, text, self.wm_size.get(), float(self.wm_op.get()),
+                              self.wm_angle.get(), colors[self.wm_color.get()], self.wm_tile.get())
+            doc.save(out, garbage=3, deflate=True)
+            doc.close()
             self.busy(False)
+            self.set_status(f"水印已添加 → {out}")
+            messagebox.showinfo("成功", f"水印已添加：\n{out}")
+        except Exception as ex:
+            self.busy(False)
+            messagebox.showerror("失败", str(ex))
 
     # ============================================================
-    #  5. Export pages as images
+    #  5. 导出图片
     # ============================================================
     def build_images(self):
         page = self.page_frame("img")
-        card = make_card(page, "Choose file")
+        card = make_card(page, "选择文件")
         card.pack(fill="x")
         self.img_var = tk.StringVar()
         self.file_row(card, self.img_var, lambda: self.pick_pdf(self.img_var))
-        c2 = make_card(page, "Image export settings")
+        c2 = make_card(page, "导出设置")
         c2.pack(fill="x", pady=(12, 0))
-        wrapped_label(c2, text="Each file contains a complete page, including its text, images, and layout. Embedded images are not extracted separately."
-                      ).pack(fill="x", padx=ui_px(16), pady=(6, 0))
         g = tk.Frame(c2, bg=C["card"])
         g.pack(fill="x", padx=16, pady=(6, 14))
-        tk.Label(g, text="Resolution (DPI)", bg=C["card"], fg=C["sub"]).grid(row=0, column=0, sticky="w", pady=6, padx=(0, 16))
+        tk.Label(g, text="清晰度 (DPI)", bg=C["card"], fg=C["sub"]).grid(row=0, column=0, sticky="w", pady=6, padx=(0, 16))
         self.img_dpi = tk.StringVar(value="200")
         ttk.Combobox(g, textvariable=self.img_dpi, values=["72", "150", "200", "300", "400"], width=8, state="readonly").grid(row=0, column=1, sticky="w")
-        tk.Label(g, text="Format", bg=C["card"], fg=C["sub"]).grid(row=1, column=0, sticky="w", pady=6)
+        tk.Label(g, text="格式", bg=C["card"], fg=C["sub"]).grid(row=1, column=0, sticky="w", pady=6)
         self.img_fmt = tk.StringVar(value="PNG")
         ttk.Combobox(g, textvariable=self.img_fmt, values=["PNG", "JPG"], width=8, state="readonly").grid(row=1, column=1, sticky="w")
         self.img_prog = ttk.Progressbar(page, mode="determinate")
         self.img_prog.pack(fill="x", pady=(16, 0))
-        ttk.Button(page, text="Export all pages as images", style="Accent.TButton", command=self.img_run).pack(anchor="e", pady=14)
+        ttk.Button(page, text="导出所有页面", style="Accent.TButton", command=self.img_run).pack(anchor="e", pady=14)
 
     def img_run(self):
         f = self.img_var.get()
         if not f:
-            messagebox.showinfo("Notice", "Choose a PDF file first.")
+            messagebox.showinfo("提示", "请先选择 PDF 文件")
             return
-        folder = filedialog.askdirectory(title="Choose output folder")
+        folder = filedialog.askdirectory(title="选择输出文件夹")
         if not folder:
             return
         try:
             doc = fitz.open(f)
             if not self.ask_password(doc, f):
-                raise ValueError("Cannot open encrypted PDF.")
+                raise ValueError("无法打开加密文件")
             base = os.path.splitext(os.path.basename(f))[0]
             z = int(self.img_dpi.get()) / 72.0
             ext = "png" if self.img_fmt.get() == "PNG" else "jpg"
@@ -2312,81 +1940,80 @@ class App:
             for i, pg in enumerate(doc):
                 pg.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False).save(os.path.join(folder, f"{base}_page{i + 1}.{ext}"))
                 self.img_prog.config(value=i + 1)
-                self.set_status(f"Exporting page {i + 1}/{doc.page_count}")
+                self.set_status(f"导出中 {i + 1}/{doc.page_count}")
             n = doc.page_count
             doc.close()
             self.busy(False)
-            self.set_status(f"Exported {n} pages as images.")
-            messagebox.showinfo("Success", f"Exported {n} pages as {n} images (one per page):\n{folder}")
+            self.set_status("导出完成")
+            messagebox.showinfo("成功", f"已导出 {n} 张图片：\n{folder}")
         except Exception as ex:
             self.busy(False)
-            messagebox.showerror("Image export failed", str(ex))
+            messagebox.showerror("导出失败", str(ex))
 
     # ============================================================
-    #  6. Security
+    #  6. 加密 / 解密
     # ============================================================
     def build_security(self):
         page = self.page_frame("sec")
-        card = make_card(page, "Choose file")
+        card = make_card(page, "选择文件")
         card.pack(fill="x")
         self.sec_var = tk.StringVar()
         self.file_row(card, self.sec_var, lambda: self.pick_pdf(self.sec_var))
-        c2 = make_card(page, "Password")
+        c2 = make_card(page, "密码")
         c2.pack(fill="x", pady=(12, 0))
         self.pwd = ttk.Entry(c2, show="●")
         self.pwd.pack(fill="x", padx=16, pady=(6, 4))
-        wrapped_label(c2, text="Encryption uses AES-256. Unlocking requires the current password."
-                      ).pack(fill="x", padx=ui_px(16), pady=(0, ui_px(14)))
+        tk.Label(c2, text="加密使用 AES-256；解密需要输入当前密码。", bg=C["card"], fg=C["sub"], font=(FONT, 9)).pack(anchor="w", padx=16, pady=(0, 14))
         r = tk.Frame(page, bg=C["bg"])
         r.pack(anchor="e", pady=14)
-        ttk.Button(r, text="Unlock PDF", command=self.sec_unlock).pack(side="left", padx=8)
-        ttk.Button(r, text="Encrypt PDF", style="Accent.TButton", command=self.sec_lock).pack(side="left")
+        ttk.Button(r, text="🔓 解除密码", command=self.sec_unlock).pack(side="left", padx=8)
+        ttk.Button(r, text="🔒 加密", style="Accent.TButton", command=self.sec_lock).pack(side="left")
 
     def sec_lock(self):
         f, pw = self.sec_var.get(), self.pwd.get()
         if not f or not pw:
-            messagebox.showinfo("Notice", "Choose a PDF file and enter a password.")
+            messagebox.showinfo("提示", "请选择文件并输入密码")
             return
         base = os.path.splitext(os.path.basename(f))[0]
-        out = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")], initialfile=f"{base}_locked.pdf")
+        out = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF 文件", "*.pdf")], initialfile=f"{base}_locked.pdf")
         if not out:
             return
         try:
             doc = fitz.open(f)
             if not self.ask_password(doc, f):
-                raise ValueError("Cannot open this PDF.")
+                raise ValueError("无法打开该文件")
             doc.save(out, encryption=fitz.PDF_ENCRYPT_AES_256, user_pw=pw, owner_pw=pw, garbage=3, deflate=True)
             doc.close()
-            self.set_status(f"Encrypted PDF saved: {out}")
-            messagebox.showinfo("Success", f"Encrypted PDF saved:\n{out}")
+            self.set_status(f"已加密 → {out}")
+            messagebox.showinfo("成功", f"已加密：\n{out}")
         except Exception as ex:
-            messagebox.showerror("Failed", str(ex))
+            messagebox.showerror("失败", str(ex))
 
     def sec_unlock(self):
         f, pw = self.sec_var.get(), self.pwd.get()
         if not f:
-            messagebox.showinfo("Notice", "Choose a PDF file first.")
+            messagebox.showinfo("提示", "请先选择 PDF 文件")
             return
         base = os.path.splitext(os.path.basename(f))[0]
-        out = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")], initialfile=f"{base}_unlocked.pdf")
+        out = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF 文件", "*.pdf")], initialfile=f"{base}_unlocked.pdf")
         if not out:
             return
         try:
             doc = fitz.open(f)
             if doc.needs_pass and not doc.authenticate(pw):
-                raise ValueError("Incorrect password.")
+                raise ValueError("密码错误")
             doc.save(out, encryption=fitz.PDF_ENCRYPT_NONE, garbage=3, deflate=True)
             doc.close()
-            self.set_status(f"Unlocked PDF saved: {out}")
-            messagebox.showinfo("Success", f"Unlocked PDF saved:\n{out}")
+            self.set_status(f"已解除密码 → {out}")
+            messagebox.showinfo("成功", f"已解除密码：\n{out}")
         except Exception as ex:
-            messagebox.showerror("Failed", str(ex))
+            messagebox.showerror("失败", str(ex))
 
 
 def main():
     if platform.system() == "Windows":
         try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # Enable high-DPI rendering on Windows.
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # 高分屏清晰显示
         except Exception:
             pass
     root = tk.Tk()
